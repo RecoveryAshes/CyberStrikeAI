@@ -86,8 +86,10 @@ func RunEinoSingleChatModelAgent(
 		})
 	}
 
+	toolInvokeNotify := einomcp.NewToolInvokeNotifyHolder()
+	einoExecMonitor := newEinoExecuteMonitorCallback(ag, recorder)
 	mainDefs := ag.ToolsForRole(roleTools)
-	mainTools, err := einomcp.ToolsFromDefinitions(ag, holder, mainDefs, recorder, toolOutputChunk)
+	mainTools, err := einomcp.ToolsFromDefinitions(ag, holder, mainDefs, recorder, toolOutputChunk, toolInvokeNotify, einoSingleAgentName)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +138,7 @@ func RunEinoSingleChatModelAgent(
 	}
 	if einoSkillMW != nil {
 		if einoFSTools && einoLoc != nil {
-			fsMw, fsErr := subAgentFilesystemMiddleware(ctx, einoLoc)
+			fsMw, fsErr := subAgentFilesystemMiddleware(ctx, einoLoc, toolInvokeNotify, einoSingleAgentName, einoExecMonitor)
 			if fsErr != nil {
 				return nil, fmt.Errorf("eino single filesystem 中间件: %w", fsErr)
 			}
@@ -232,6 +234,7 @@ func RunEinoSingleChatModelAgent(
 		CheckpointDir:        ma.EinoMiddleware.CheckpointDir,
 		McpIDsMu:             &mcpIDsMu,
 		McpIDs:               &mcpIDs,
+		ToolInvokeNotify:     toolInvokeNotify,
 		DA:                   chatAgent,
 		EmptyResponseMessage: "(Eino ADK single-agent session completed but no assistant text was captured. Check process details or logs.) " +
 			"（Eino ADK 单代理会话已完成，但未捕获到助手文本输出。请查看过程详情或日志。）",

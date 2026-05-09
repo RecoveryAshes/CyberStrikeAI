@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"cyberstrike-ai/internal/einomcp"
 
@@ -20,7 +21,9 @@ import (
 )
 
 // normalizeStreamingDelta 将可能是“累计片段”的 chunk 归一化为“纯增量”。
-// 一些模型/桥接层在流式过程中会重复发送已输出前缀，前端若直接 buffer+=chunk 会出现“结巴”重复。
+// 一些模型/桥接层在流式过程中会重复发送已输出前缀，前端若直接 buffer+=chunk 会出现重复文本。
+//
+// 注意：与 internal/openai.normalizeStreamingDelta 保持一致。
 func normalizeStreamingDelta(current, incoming string) (next, delta string) {
 	if incoming == "" {
 		return current, ""
@@ -28,27 +31,11 @@ func normalizeStreamingDelta(current, incoming string) (next, delta string) {
 	if current == "" {
 		return incoming, incoming
 	}
-	if incoming == current {
-		return current, ""
-	}
-	// incoming 是累计全文（包含 current 前缀）
-	if strings.HasPrefix(incoming, current) {
+	if strings.HasPrefix(incoming, current) && len(incoming) > len(current) {
 		return incoming, incoming[len(current):]
 	}
-	// incoming 完全是已输出尾部重发
-	if strings.HasSuffix(current, incoming) {
+	if incoming == current && utf8.RuneCountInString(current) > 1 {
 		return current, ""
-	}
-
-	// 处理边界重叠：current 后缀与 incoming 前缀重叠，只追加非重叠部分。
-	max := len(current)
-	if len(incoming) < max {
-		max = len(incoming)
-	}
-	for overlap := max; overlap > 0; overlap-- {
-		if current[len(current)-overlap:] == incoming[:overlap] {
-			return current + incoming[overlap:], incoming[overlap:]
-		}
 	}
 	return current + incoming, incoming
 }
@@ -82,6 +69,9 @@ type einoADKRunLoopArgs struct {
 
 	McpIDsMu *sync.Mutex
 	McpIDs   *[]string
+
+	// ToolInvokeNotify 与 einomcp.ToolsFromDefinitions 共享：run loop 在迭代前 Set，MCP 桥 Fire 以补全 tool_result。
+	ToolInvokeNotify *einomcp.ToolInvokeNotifyHolder
 
 	DA adk.Agent
 
@@ -222,6 +212,63 @@ func runEinoADKAgentLoop(ctx context.Context, args *einoADKRunLoopArgs, baseMsgs
 		}
 		pendingByID = make(map[string]toolCallPendingInfo)
 		pendingQueueByAgent = make(map[string][]string)
+	}
+
+	// 最近一次成功的 Eino filesystem execute 的标准输出（trim）：用于抑制模型紧接着复述同一字符串时的重复「助手输出」时间线。
+	var executeStdoutDupMu sync.Mutex
+	var pendingExecuteStdoutDup string
+	recordPendingExecuteStdoutDup := func(toolName, stdout string, isErr bool) {
+		if isErr || !strings.EqualFold(strings.TrimSpace(toolName), "execute") {
+			return
+		}
+		t := strings.TrimSpace(stdout)
+		if t == "" {
+			return
+		}
+		executeStdoutDupMu.Lock()
+		pendingExecuteStdoutDup = t
+		executeStdoutDupMu.Unlock()
+	}
+
+	var toolResultSent sync.Map // toolCallID -> struct{}；与 ADK Tool 消息去重，避免 bridge 与事件流各推一次
+	if args.ToolInvokeNotify != nil {
+		args.ToolInvokeNotify.Set(func(toolCallID, toolName, einoAgent string, success bool, content string, invokeErr error) {
+			tid := strings.TrimSpace(toolCallID)
+			removePendingByID(tid)
+			if tid == "" || progress == nil {
+				return
+			}
+			if _, loaded := toolResultSent.LoadOrStore(tid, struct{}{}); loaded {
+				return
+			}
+			isErr := !success || invokeErr != nil
+			body := content
+			if invokeErr != nil {
+				body = invokeErr.Error()
+				isErr = true
+			}
+			recordPendingExecuteStdoutDup(toolName, body, isErr)
+			preview := body
+			if len(preview) > 200 {
+				preview = preview[:200] + "..."
+			}
+			agentTag := strings.TrimSpace(einoAgent)
+			if agentTag == "" {
+				agentTag = orchestratorName
+			}
+			progress("tool_result", fmt.Sprintf("工具结果 (%s)", toolName), map[string]interface{}{
+				"toolName":       toolName,
+				"success":        !isErr,
+				"isError":        isErr,
+				"result":         body,
+				"resultPreview":  preview,
+				"toolCallId":     tid,
+				"conversationId": conversationID,
+				"einoAgent":      agentTag,
+				"einoRole":       einoRoleTag(agentTag),
+				"source":         "eino",
+			})
+		})
 	}
 
 	runnerCfg := adk.RunnerConfig{
@@ -467,6 +514,7 @@ func runEinoADKAgentLoop(ctx context.Context, args *einoADKRunLoopArgs, baseMsgs
 			var subAssistantBuf string
 			var subReplyStreamID string
 			var mainAssistantBuf string
+			var mainAssistDupTarget string // 非空表示本段主助手流需缓冲至 EOF，与 execute 输出比对去重
 			var reasoningBuf string
 			var streamRecvErr error
 			for {
@@ -511,24 +559,35 @@ func runEinoADKAgentLoop(ctx context.Context, args *einoADKRunLoopArgs, baseMsgs
 						var contentDelta string
 						mainAssistantBuf, contentDelta = normalizeStreamingDelta(mainAssistantBuf, chunk.Content)
 						if contentDelta != "" {
-							if !streamHeaderSent {
-								progress("response_start", "", map[string]interface{}{
-									"conversationId":     conversationID,
-									"mcpExecutionIds":    snapshotMCPIDs(),
-									"messageGeneratedBy": "eino:" + ev.AgentName,
-									"einoRole":           "orchestrator",
-									"einoAgent":          ev.AgentName,
-									"orchestration":      orchMode,
-								})
-								streamHeaderSent = true
+							if mainAssistDupTarget == "" {
+								executeStdoutDupMu.Lock()
+								if pendingExecuteStdoutDup != "" {
+									mainAssistDupTarget = pendingExecuteStdoutDup
+								}
+								executeStdoutDupMu.Unlock()
 							}
-							progress("response_delta", contentDelta, map[string]interface{}{
-								"conversationId":  conversationID,
-								"mcpExecutionIds": snapshotMCPIDs(),
-								"einoRole":        "orchestrator",
-								"einoAgent":       ev.AgentName,
-								"orchestration":   orchMode,
-							})
+							if mainAssistDupTarget != "" {
+								// 已展示过 tool_result，缓冲全文；EOF 后与 execute 输出相同则不再发助手流
+							} else {
+								if !streamHeaderSent {
+									progress("response_start", "", map[string]interface{}{
+										"conversationId":     conversationID,
+										"mcpExecutionIds":    snapshotMCPIDs(),
+										"messageGeneratedBy": "eino:" + ev.AgentName,
+										"einoRole":           "orchestrator",
+										"einoAgent":          ev.AgentName,
+										"orchestration":      orchMode,
+									})
+									streamHeaderSent = true
+								}
+								progress("response_delta", contentDelta, map[string]interface{}{
+									"conversationId":  conversationID,
+									"mcpExecutionIds": snapshotMCPIDs(),
+									"einoRole":        "orchestrator",
+									"einoAgent":       ev.AgentName,
+									"orchestration":   orchMode,
+								})
+							}
 						}
 					} else if !streamsMainAssistant(ev.AgentName) {
 						var subDelta string
@@ -558,7 +617,43 @@ func runEinoADKAgentLoop(ctx context.Context, args *einoADKRunLoopArgs, baseMsgs
 				}
 			}
 			if streamsMainAssistant(ev.AgentName) {
-				if s := strings.TrimSpace(mainAssistantBuf); s != "" {
+				s := strings.TrimSpace(mainAssistantBuf)
+				if mainAssistDupTarget != "" {
+					executeStdoutDupMu.Lock()
+					pendingExecuteStdoutDup = ""
+					executeStdoutDupMu.Unlock()
+					if s != "" && s == mainAssistDupTarget {
+						// 与刚展示的 execute 结果完全一致：不再发助手流式事件，仍写入轨迹与最终回复字段
+						lastAssistant = s
+						runAccumulatedMsgs = append(runAccumulatedMsgs, schema.AssistantMessage(s, nil))
+						if orchMode == "plan_execute" && strings.EqualFold(strings.TrimSpace(ev.AgentName), "executor") {
+							lastPlanExecuteExecutor = UnwrapPlanExecuteUserText(s)
+						}
+					} else if s != "" {
+						if progress != nil {
+							progress("response_start", "", map[string]interface{}{
+								"conversationId":     conversationID,
+								"mcpExecutionIds":    snapshotMCPIDs(),
+								"messageGeneratedBy": "eino:" + ev.AgentName,
+								"einoRole":           "orchestrator",
+								"einoAgent":          ev.AgentName,
+								"orchestration":      orchMode,
+							})
+							progress("response_delta", s, map[string]interface{}{
+								"conversationId":  conversationID,
+								"mcpExecutionIds": snapshotMCPIDs(),
+								"einoRole":        "orchestrator",
+								"einoAgent":       ev.AgentName,
+								"orchestration":   orchMode,
+							})
+						}
+						lastAssistant = s
+						runAccumulatedMsgs = append(runAccumulatedMsgs, schema.AssistantMessage(s, nil))
+						if orchMode == "plan_execute" && strings.EqualFold(strings.TrimSpace(ev.AgentName), "executor") {
+							lastPlanExecuteExecutor = UnwrapPlanExecuteUserText(s)
+						}
+					}
+				} else if s != "" {
 					lastAssistant = s
 					runAccumulatedMsgs = append(runAccumulatedMsgs, schema.AssistantMessage(s, nil))
 					if orchMode == "plan_execute" && strings.EqualFold(strings.TrimSpace(ev.AgentName), "executor") {
@@ -627,26 +722,42 @@ func runEinoADKAgentLoop(ctx context.Context, args *einoADKRunLoopArgs, baseMsgs
 			body := strings.TrimSpace(msg.Content)
 			if body != "" {
 				if streamsMainAssistant(ev.AgentName) {
-					if progress != nil {
-						progress("response_start", "", map[string]interface{}{
-							"conversationId":     conversationID,
-							"mcpExecutionIds":    snapshotMCPIDs(),
-							"messageGeneratedBy": "eino:" + ev.AgentName,
-							"einoRole":           "orchestrator",
-							"einoAgent":          ev.AgentName,
-							"orchestration":      orchMode,
-						})
-						progress("response_delta", body, map[string]interface{}{
-							"conversationId":  conversationID,
-							"mcpExecutionIds": snapshotMCPIDs(),
-							"einoRole":        "orchestrator",
-							"einoAgent":       ev.AgentName,
-							"orchestration":   orchMode,
-						})
-					}
-					lastAssistant = body
-					if orchMode == "plan_execute" && strings.EqualFold(strings.TrimSpace(ev.AgentName), "executor") {
-						lastPlanExecuteExecutor = UnwrapPlanExecuteUserText(body)
+					executeStdoutDupMu.Lock()
+					dup := pendingExecuteStdoutDup
+					if dup != "" && body == dup {
+						pendingExecuteStdoutDup = ""
+						executeStdoutDupMu.Unlock()
+						lastAssistant = body
+						if orchMode == "plan_execute" && strings.EqualFold(strings.TrimSpace(ev.AgentName), "executor") {
+							lastPlanExecuteExecutor = UnwrapPlanExecuteUserText(body)
+						}
+						// 非流式：与 execute 输出相同则跳过助手通道展示（msg 已在上方写入 runAccumulatedMsgs）
+					} else {
+						if dup != "" {
+							pendingExecuteStdoutDup = ""
+						}
+						executeStdoutDupMu.Unlock()
+						if progress != nil {
+							progress("response_start", "", map[string]interface{}{
+								"conversationId":     conversationID,
+								"mcpExecutionIds":    snapshotMCPIDs(),
+								"messageGeneratedBy": "eino:" + ev.AgentName,
+								"einoRole":           "orchestrator",
+								"einoAgent":          ev.AgentName,
+								"orchestration":      orchMode,
+							})
+							progress("response_delta", body, map[string]interface{}{
+								"conversationId":  conversationID,
+								"mcpExecutionIds": snapshotMCPIDs(),
+								"einoRole":        "orchestrator",
+								"einoAgent":       ev.AgentName,
+								"orchestration":   orchMode,
+							})
+						}
+						lastAssistant = body
+						if orchMode == "plan_execute" && strings.EqualFold(strings.TrimSpace(ev.AgentName), "executor") {
+							lastPlanExecuteExecutor = UnwrapPlanExecuteUserText(body)
+						}
 					}
 				} else if progress != nil {
 					progress("eino_agent_reply", body, map[string]interface{}{
@@ -702,12 +813,15 @@ func runEinoADKAgentLoop(ctx context.Context, args *einoADKRunLoopArgs, baseMsgs
 						break
 					}
 				}
-			} else {
-				removePendingByID(toolCallID)
 			}
 			if toolCallID != "" {
+				removePendingByID(toolCallID)
+				if _, loaded := toolResultSent.LoadOrStore(toolCallID, struct{}{}); loaded {
+					continue
+				}
 				data["toolCallId"] = toolCallID
 			}
+			recordPendingExecuteStdoutDup(toolName, content, isErr)
 			progress("tool_result", fmt.Sprintf("工具结果 (%s)", toolName), data)
 		}
 	}

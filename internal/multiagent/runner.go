@@ -110,6 +110,7 @@ func RunDeepAgent(
 		mcpIDs = append(mcpIDs, id)
 		mcpIDsMu.Unlock()
 	}
+	einoExecMonitor := newEinoExecuteMonitorCallback(ag, recorder)
 
 	// 与单代理流式一致：在 response_start / response_delta 的 data 中带当前 mcpExecutionIds，供主聊天绑定复制与展示。
 	snapshotMCPIDs := func() []string {
@@ -120,6 +121,7 @@ func RunDeepAgent(
 		return out
 	}
 
+	toolInvokeNotify := einomcp.NewToolInvokeNotifyHolder()
 	mainDefs := ag.ToolsForRole(roleTools)
 	toolOutputChunk := func(toolName, toolCallID, chunk string) {
 		// When toolCallId is missing, frontend ignores tool_result_delta.
@@ -135,16 +137,6 @@ func RunDeepAgent(
 			"iteration": 0,
 			"source":    "eino",
 		})
-	}
-
-	mainTools, err := einomcp.ToolsFromDefinitions(ag, holder, mainDefs, recorder, toolOutputChunk)
-	if err != nil {
-		return nil, err
-	}
-
-	mainToolsForCfg, mainOrchestratorPre, err := prependEinoMiddlewares(ctx, &ma.EinoMiddleware, einoMWMain, mainTools, einoLoc, skillsRoot, conversationID, logger)
-	if err != nil {
-		return nil, err
 	}
 
 	httpClient := &http.Client{
@@ -222,7 +214,7 @@ func RunDeepAgent(
 			}
 
 			subDefs := ag.ToolsForRole(roleTools)
-			subTools, err := einomcp.ToolsFromDefinitions(ag, holder, subDefs, recorder, toolOutputChunk)
+			subTools, err := einomcp.ToolsFromDefinitions(ag, holder, subDefs, recorder, toolOutputChunk, toolInvokeNotify, id)
 			if err != nil {
 				return nil, fmt.Errorf("子代理 %q 工具: %w", id, err)
 			}
@@ -248,7 +240,7 @@ func RunDeepAgent(
 			}
 			if einoSkillMW != nil {
 				if einoFSTools && einoLoc != nil {
-					subFs, fsErr := subAgentFilesystemMiddleware(ctx, einoLoc)
+					subFs, fsErr := subAgentFilesystemMiddleware(ctx, einoLoc, toolInvokeNotify, id, einoExecMonitor)
 					if fsErr != nil {
 						return nil, fmt.Errorf("子代理 %q filesystem 中间件: %w", id, fsErr)
 					}
@@ -338,6 +330,16 @@ func RunDeepAgent(
 			orchDescription = d
 		}
 	}
+
+	mainTools, err := einomcp.ToolsFromDefinitions(ag, holder, mainDefs, recorder, toolOutputChunk, toolInvokeNotify, orchestratorName)
+	if err != nil {
+		return nil, err
+	}
+	mainToolsForCfg, mainOrchestratorPre, err := prependEinoMiddlewares(ctx, &ma.EinoMiddleware, einoMWMain, mainTools, einoLoc, skillsRoot, conversationID, logger)
+	if err != nil {
+		return nil, err
+	}
+
 	orchInstruction = injectToolNamesOnlyInstruction(ctx, orchInstruction, mainTools)
 	if logger != nil {
 		mainNames := collectToolNames(ctx, mainTools)
@@ -381,7 +383,12 @@ func RunDeepAgent(
 	var deepShell filesystem.StreamingShell
 	if einoLoc != nil && einoFSTools {
 		deepBackend = einoLoc
-		deepShell = einoLoc
+		deepShell = &einoStreamingShellWrap{
+			inner:         einoLoc,
+			invokeNotify:  toolInvokeNotify,
+			einoAgentName: orchestratorName,
+			recordMonitor: einoExecMonitor,
+		}
 	}
 
 	// noNestedTaskMiddleware 必须在最外层（最先拦截），防止 skill 或其他中间件内部触发 task 调用绕过检测。
@@ -438,7 +445,7 @@ func RunDeepAgent(
 		// 构建 filesystem 中间件（与 Deep sub-agent 一致）
 		var peFsMw adk.ChatModelAgentMiddleware
 		if einoSkillMW != nil && einoFSTools && einoLoc != nil {
-			peFsMw, err = subAgentFilesystemMiddleware(ctx, einoLoc)
+			peFsMw, err = subAgentFilesystemMiddleware(ctx, einoLoc, toolInvokeNotify, "executor", einoExecMonitor)
 			if err != nil {
 				return nil, fmt.Errorf("plan_execute filesystem 中间件: %w", err)
 			}
@@ -560,6 +567,7 @@ func RunDeepAgent(
 		CheckpointDir:        ma.EinoMiddleware.CheckpointDir,
 		McpIDsMu:             &mcpIDsMu,
 		McpIDs:               &mcpIDs,
+		ToolInvokeNotify:     toolInvokeNotify,
 		DA:                   da,
 		EmptyResponseMessage: "(Eino multi-agent orchestration completed but no assistant text was captured. Check process details or logs.) " +
 			"（Eino 多代理编排已完成，但未捕获到助手文本输出。请查看过程详情或日志。）",

@@ -1909,6 +1909,15 @@ func (a *Agent) ExecuteMCPToolForConversation(ctx context.Context, conversationI
 	return a.executeToolViaMCP(ctx, toolName, args)
 }
 
+// RecordLocalToolExecution 将非 CallTool 路径完成的工具调用写入 MCP 监控库（与 CallTool 落库一致），返回 executionId。
+// 用于 Eino filesystem execute 等场景，使助手气泡「渗透测试详情」与常规 MCP 一致可点进监控。
+func (a *Agent) RecordLocalToolExecution(toolName string, args map[string]interface{}, resultText string, invokeErr error) string {
+	if a == nil || a.mcpServer == nil {
+		return ""
+	}
+	return a.mcpServer.RecordCompletedToolInvocation(toolName, args, resultText, invokeErr)
+}
+
 // CancelMCPToolExecutionWithNote 取消一次进行中的 MCP 工具（先内部后外部），与监控页「终止工具」一致；note 非空时合并进返回给模型的文本。
 func (a *Agent) CancelMCPToolExecutionWithNote(executionID, note string) bool {
 	executionID = strings.TrimSpace(executionID)
