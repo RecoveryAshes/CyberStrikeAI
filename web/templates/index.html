@@ -1446,10 +1446,14 @@
                         <div class="vulnerability-controls" id="vulnerability-filter-panel">
                             <div class="vulnerability-filter-toolbar">
                                 <div class="vulnerability-filter-primary">
-                                    <label class="vulnerability-filter-field vulnerability-filter-field--grow">
-                                        <span class="sr-only" data-i18n="vulnerabilityPage.vulnId">漏洞ID</span>
-                                        <input type="search" id="vulnerability-id-filter" autocomplete="off"
-                                            data-i18n="vulnerabilityPage.searchVulnId" data-i18n-attr="placeholder" placeholder="搜索漏洞 ID，回车筛选" />
+                                    <label class="vulnerability-filter-field vulnerability-filter-field--grow vulnerability-search-wrap">
+                                        <span class="sr-only" data-i18n="vulnerabilityPage.searchKeyword">关键词搜索</span>
+                                        <svg class="vulnerability-search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+                                            <circle cx="11" cy="11" r="7" stroke="currentColor" stroke-width="2"/>
+                                            <path d="M20 20L16 16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                                        </svg>
+                                        <input type="search" id="vulnerability-search-filter" autocomplete="off"
+                                            data-i18n="vulnerabilityPage.searchKeyword" data-i18n-attr="placeholder" placeholder="搜索标题、描述、类型、目标…" />
                                     </label>
                                     <label class="vulnerability-filter-field vulnerability-filter-field--status">
                                         <span class="sr-only" data-i18n="vulnerabilityPage.status">状态</span>
@@ -1461,7 +1465,52 @@
                                             <option value="false_positive" data-i18n="vulnerabilityPage.statusFalsePositive">误报</option>
                                         </select>
                                     </label>
-                                    <button type="button" class="vulnerability-filter-clear-btn" onclick="clearVulnerabilityFilters()" data-i18n="vulnerabilityPage.clear">清除</button>
+                                    <div class="vulnerability-filter-actions">
+                                        <div class="vulnerability-more-filters-anchor">
+                                            <button type="button" class="btn-secondary vulnerability-more-filters-btn" id="vulnerability-more-filters-btn"
+                                                aria-expanded="false" aria-haspopup="dialog" aria-controls="vulnerability-more-filters-popover">
+                                                <span data-i18n="vulnerabilityPage.moreFilters">更多筛选</span>
+                                                <span class="vulnerability-filter-advanced-badge" id="vulnerability-advanced-badge" hidden></span>
+                                            </button>
+                                            <div class="vulnerability-more-filters-popover" id="vulnerability-more-filters-popover" hidden role="dialog"
+                                                aria-labelledby="vulnerability-more-filters-title">
+                                                <p class="vulnerability-more-filters-popover-title" id="vulnerability-more-filters-title" data-i18n="vulnerabilityPage.moreFilters">更多筛选</p>
+                                                <div class="vulnerability-more-filters-popover-body">
+                                                    <label class="vulnerability-filter-field vulnerability-filter-field--full">
+                                                        <span data-i18n="vulnerabilityPage.vulnId">漏洞 ID</span>
+                                                        <input type="text" id="vulnerability-exact-id-filter"
+                                                            data-i18n="vulnerabilityPage.filterExactId" data-i18n-attr="placeholder" placeholder="精确匹配漏洞 ID" />
+                                                    </label>
+                                                    <label class="vulnerability-filter-field">
+                                                        <span data-i18n="vulnerabilityPage.conversationId">会话 ID</span>
+                                                        <input type="text" id="vulnerability-conversation-filter" list="vulnerability-conversation-suggestions"
+                                                            data-i18n="vulnerabilityPage.filterConversation" data-i18n-attr="placeholder" placeholder="筛选特定会话" />
+                                                    </label>
+                                                    <label class="vulnerability-filter-field">
+                                                        <span data-i18n="vulnerabilityPage.taskOrQueueId">任务 / 队列 ID</span>
+                                                        <input type="text" id="vulnerability-task-filter" list="vulnerability-task-suggestions"
+                                                            data-i18n="vulnerabilityPage.filterTaskOrQueue" data-i18n-attr="placeholder" placeholder="筛选任务或队列 ID" />
+                                                    </label>
+                                                    <label class="vulnerability-filter-field">
+                                                        <span data-i18n="vulnerabilityPage.conversationTag">对话标签</span>
+                                                        <input type="text" id="vulnerability-conversation-tag-filter" list="vulnerability-conversation-tag-suggestions"
+                                                            data-i18n="vulnerabilityPage.filterConversationTag" data-i18n-attr="placeholder" placeholder="筛选对话标签" />
+                                                    </label>
+                                                    <label class="vulnerability-filter-field">
+                                                        <span data-i18n="vulnerabilityPage.taskTag">任务标签</span>
+                                                        <input type="text" id="vulnerability-task-tag-filter" list="vulnerability-task-tag-suggestions"
+                                                            data-i18n="vulnerabilityPage.filterTaskTag" data-i18n-attr="placeholder" placeholder="筛选任务标签" />
+                                                    </label>
+                                                </div>
+                                                <div class="vulnerability-more-filters-popover-footer">
+                                                    <button type="button" class="btn-secondary" id="vulnerability-more-filters-reset" data-i18n="vulnerabilityPage.clearAdvanced">清空</button>
+                                                    <button type="button" class="btn-primary" id="vulnerability-more-filters-apply" data-i18n="vulnerabilityPage.applyFilters">应用</button>
+                                                </div>
+                                            </div>
+                                        </div>
+                                        <button type="button" class="vulnerability-filter-clear-btn" id="vulnerability-filter-clear-btn"
+                                            onclick="clearVulnerabilityFilters()" hidden data-i18n="vulnerabilityPage.clearAll">重置全部</button>
+                                    </div>
                                 </div>
                                 <select id="vulnerability-severity-filter" class="vulnerability-severity-sync" hidden aria-hidden="true" tabindex="-1">
                                     <option value=""></option>
@@ -1472,34 +1521,8 @@
                                     <option value="info">info</option>
                                 </select>
                             </div>
-                            <div class="vulnerability-filter-advanced-wrap">
-                                <button type="button" class="vulnerability-filter-advanced-toggle" id="vulnerability-advanced-toggle"
-                                    aria-expanded="false" aria-controls="vulnerability-advanced-filters"
-                                    onclick="toggleVulnerabilityAdvancedFilters(event)">
-                                    <span class="vulnerability-filter-advanced-chevron" aria-hidden="true"></span>
-                                    <span data-i18n="vulnerabilityPage.advancedFilters">高级筛选</span>
-                                    <span class="vulnerability-filter-advanced-badge" id="vulnerability-advanced-badge" hidden></span>
-                                </button>
-                                <div class="vulnerability-filter-advanced" id="vulnerability-advanced-filters" hidden>
-                                    <label class="vulnerability-filter-field">
-                                        <span data-i18n="vulnerabilityPage.conversationId">会话 ID</span>
-                                        <input type="text" id="vulnerability-conversation-filter" list="vulnerability-conversation-suggestions" placeholder="回车筛选" />
-                                    </label>
-                                    <label class="vulnerability-filter-field">
-                                        <span data-i18n="vulnerabilityPage.taskOrQueueId">任务 / 队列 ID</span>
-                                        <input type="text" id="vulnerability-task-filter" list="vulnerability-task-suggestions" placeholder="回车筛选" />
-                                    </label>
-                                    <label class="vulnerability-filter-field">
-                                        <span data-i18n="vulnerabilityPage.conversationTag">对话标签</span>
-                                        <input type="text" id="vulnerability-conversation-tag-filter" list="vulnerability-conversation-tag-suggestions" placeholder="回车筛选" />
-                                    </label>
-                                    <label class="vulnerability-filter-field">
-                                        <span data-i18n="vulnerabilityPage.taskTag">任务标签</span>
-                                        <input type="text" id="vulnerability-task-tag-filter" list="vulnerability-task-tag-suggestions" placeholder="回车筛选" />
-                                    </label>
-                                </div>
-                            </div>
                             <div class="vulnerability-filter-chips" id="vulnerability-filter-chips" hidden>
+                                <span class="vulnerability-filter-chips-label" data-i18n="vulnerabilityPage.activeFilters">已选条件</span>
                                 <div class="vulnerability-filter-chips-list" id="vulnerability-filter-chips-list" role="list"></div>
                             </div>
                             <datalist id="vulnerability-conversation-suggestions"></datalist>

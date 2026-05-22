@@ -16990,8 +16990,8 @@ header {
 }
 
 .vulnerability-controls {
-    margin-bottom: 16px;
-    padding: 10px 12px;
+    margin-bottom: 12px;
+    padding: 8px 10px;
     background: var(--bg-primary);
     border: 1px solid var(--border-color);
     border-radius: 10px;
@@ -17014,6 +17014,117 @@ header {
     align-items: center;
     gap: 8px;
     min-width: 0;
+}
+
+.vulnerability-filter-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.vulnerability-search-wrap {
+    position: relative;
+    gap: 0;
+}
+
+.vulnerability-search-wrap .vulnerability-search-icon {
+    position: absolute;
+    left: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-secondary);
+    pointer-events: none;
+    flex-shrink: 0;
+}
+
+.vulnerability-search-wrap input[type="search"] {
+    padding-left: 32px;
+}
+
+.vulnerability-more-filters-anchor {
+    position: relative;
+}
+
+.vulnerability-more-filters-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+    padding: 8px 12px;
+    font-size: 0.875rem;
+}
+
+.vulnerability-more-filters-btn.is-active {
+    border-color: #3b82f6;
+    color: #2563eb;
+    background: rgba(59, 130, 246, 0.06);
+}
+
+.vulnerability-more-filters-popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 120;
+    width: min(420px, calc(100vw - 32px));
+    padding: 12px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    box-shadow: var(--shadow-md, 0 8px 24px rgba(15, 23, 42, 0.12));
+}
+
+.vulnerability-more-filters-popover[hidden] {
+    display: none !important;
+}
+
+.vulnerability-more-filters-popover-title {
+    margin: 0 0 10px;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.vulnerability-more-filters-popover-body {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px 12px;
+}
+
+.vulnerability-more-filters-popover-body .vulnerability-filter-field--full {
+    grid-column: 1 / -1;
+}
+
+.vulnerability-more-filters-popover-body .vulnerability-filter-field {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+}
+
+.vulnerability-more-filters-popover-body .vulnerability-filter-field > span {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+}
+
+.vulnerability-more-filters-popover-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 12px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border-color);
+}
+
+@media (max-width: 520px) {
+    .vulnerability-more-filters-popover-body {
+        grid-template-columns: 1fr;
+    }
+
+    .vulnerability-more-filters-popover {
+        right: auto;
+        left: 0;
+    }
 }
 
 .vulnerability-filter-field {
@@ -17061,6 +17172,10 @@ header {
     box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.12);
 }
 
+.vulnerability-filter-clear-btn[hidden] {
+    display: none !important;
+}
+
 .vulnerability-filter-clear-btn {
     flex-shrink: 0;
     padding: 8px 12px;
@@ -17078,69 +17193,7 @@ header {
     background: rgba(59, 130, 246, 0.06);
 }
 
-/* tasks-filters 的 display:flex 会覆盖 [hidden]，必须显式隐藏 */
-#vulnerability-advanced-filters[hidden] {
-    display: none !important;
-}
-
-.vulnerability-filter-advanced-wrap {
-    margin-top: 6px;
-}
-
-.vulnerability-filter-advanced-wrap.is-expanded {
-    margin-top: 10px;
-    padding-top: 10px;
-    border-top: 1px dashed var(--border-color);
-}
-
-.vulnerability-filter-advanced {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 10px 14px;
-}
-
-.vulnerability-filter-advanced .vulnerability-filter-field {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 4px;
-}
-
-.vulnerability-filter-advanced .vulnerability-filter-field > span {
-    max-width: none;
-    font-size: 0.75rem;
-}
-
-.vulnerability-filter-advanced .vulnerability-filter-field input {
-    width: 100%;
-}
-
-@media (max-width: 768px) {
-    .vulnerability-filter-advanced {
-        grid-template-columns: 1fr;
-    }
-}
-
-.vulnerability-filter-advanced-toggle {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 8px;
-    margin: 0 0 8px;
-    border: none;
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: 0.8125rem;
-    cursor: pointer;
-    border-radius: 6px;
-    transition: color 0.15s ease, background 0.15s ease;
-}
-
-.vulnerability-filter-advanced-toggle:hover {
-    color: var(--text-primary);
-    background: rgba(0, 0, 0, 0.04);
-}
-
-/* 高级筛选生效数量：弱提示文字，避免实心蓝点过于抢眼 */
+/* 更多筛选生效数量：弱提示文字 */
 .vulnerability-filter-advanced-badge {
     display: inline;
     margin-left: 2px;
@@ -17155,28 +17208,21 @@ header {
     display: none !important;
 }
 
-.vulnerability-filter-advanced-chevron {
-    display: inline-block;
-    width: 0;
-    height: 0;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid currentColor;
-    transition: transform 0.2s ease;
-}
-
-.vulnerability-filter-advanced-toggle[aria-expanded="true"] .vulnerability-filter-advanced-chevron {
-    transform: rotate(180deg);
-}
-
 .vulnerability-filter-chips {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 6px;
-    margin-top: 10px;
-    padding-top: 10px;
+    gap: 6px 8px;
+    margin-top: 8px;
+    padding-top: 8px;
     border-top: 1px solid var(--border-color);
+}
+
+.vulnerability-filter-chips-label {
+    flex-shrink: 0;
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--text-secondary);
 }
 
 .vulnerability-filter-chips-list {
@@ -17222,8 +17268,13 @@ header {
         flex: 1 1 100%;
     }
 
+    .vulnerability-filter-actions {
+        width: 100%;
+        justify-content: flex-end;
+    }
+
     .vulnerability-filter-clear-btn {
-        align-self: flex-end;
+        margin-left: auto;
     }
 }
 
