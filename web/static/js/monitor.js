@@ -225,6 +225,17 @@ function finalizeOutstandingToolCallsForProgress(progressId, finalStatus) {
 // 模型流式输出缓存：progressId -> { assistantId, buffer }
 const responseStreamStateByProgressId = new Map();
 
+/** 同一段主通道流式输出（Eino 可能重复 response_start） */
+function sameMainResponseStreamMeta(a, b) {
+    if (!a || !b) return false;
+    const agentA = String(a.einoAgent != null ? a.einoAgent : '').trim();
+    const agentB = String(b.einoAgent != null ? b.einoAgent : '').trim();
+    if (!agentA || agentA !== agentB) return false;
+    const orchA = String(a.orchestration != null ? a.orchestration : '').trim();
+    const orchB = String(b.orchestration != null ? b.orchestration : '').trim();
+    return orchA === orchB;
+}
+
 // AI 思考流式输出：progressId -> Map(streamId -> { itemId, buffer })
 const thinkingStreamStateByProgressId = new Map();
 
@@ -1889,9 +1900,19 @@ function handleStreamEvent(event, progressElement, progressId,
             }
 
             // 多代理模式下，迭代过程中的输出只显示在时间线中，不创建助手消息气泡
-            // 同一 progressId 再次 response_start 时先移除旧占位，避免多条「助手输出」卡片且仅最后一条收 delta
-            // 改为保留旧占位，让每一段 response_start 都能在时间线中完整展示。
-            // 创建时间线条目用于显示迭代过程中的输出
+            const prevStream = responseStreamStateByProgressId.get(progressId);
+            if (prevStream && prevStream.itemId && sameMainResponseStreamMeta(prevStream.streamMeta, responseData)) {
+                // Eino 可能对同一段流重复发 response_start；复用已有条目与 buffer，避免多条「助手输出」
+                prevStream.streamMeta = Object.assign({}, prevStream.streamMeta || {}, responseData);
+                responseStreamStateByProgressId.set(progressId, prevStream);
+                break;
+            }
+            if (prevStream && prevStream.itemId) {
+                const oldItem = document.getElementById(prevStream.itemId);
+                if (oldItem && oldItem.parentNode) {
+                    oldItem.parentNode.removeChild(oldItem);
+                }
+            }
             const title = einoMainStreamPlanningTitle(responseData);
             const itemId = addTimelineItem(timeline, 'thinking', {
                 title: title,
