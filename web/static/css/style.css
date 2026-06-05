@@ -1217,13 +1217,6 @@ header {
     user-select: none;
 }
 
-.hitl-sidebar-header-actions {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    flex-shrink: 0;
-}
-
 .hitl-sidebar-body {
     overflow: hidden;
     max-height: 500px;
@@ -1236,10 +1229,6 @@ header {
     max-height: 0;
     opacity: 0;
     margin-top: 0;
-}
-
-.hitl-sidebar-collapsed .hitl-apply-btn {
-    display: none;
 }
 
 .hitl-sidebar-heading {
@@ -1357,6 +1346,14 @@ header {
 
 .hitl-config-field--tools {
     margin-bottom: 0;
+}
+
+.hitl-config-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid rgba(15, 23, 42, 0.06);
 }
 
 .hitl-config-label {
@@ -2532,8 +2529,8 @@ header {
 .conversation-reasoning-card-header {
     display: flex;
     align-items: center;
-    justify-content: flex-start;
-    gap: 0;
+    justify-content: space-between;
+    gap: 8px;
     width: 100%;
     padding: 0;
     margin: 0;
@@ -2548,8 +2545,32 @@ header {
     border-radius: 0;
 }
 
-.conversation-reasoning-card-header:hover .conversation-reasoning-title {
+.conversation-reasoning-card-header:hover .conversation-reasoning-title,
+.hitl-sidebar-card-header:hover .hitl-sidebar-title {
     color: var(--accent-color);
+}
+
+.sidebar-card-chevron {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-secondary);
+    transition: transform 0.2s ease, color 0.2s ease;
+}
+
+.sidebar-card-chevron svg {
+    display: block;
+}
+
+.conversation-reasoning-card-header:hover .sidebar-card-chevron,
+.hitl-sidebar-card-header:hover .sidebar-card-chevron {
+    color: var(--accent-color);
+}
+
+.conversation-reasoning-card:not(.conversation-reasoning-collapsed) .conversation-reasoning-chevron,
+.hitl-sidebar-card:not(.hitl-sidebar-collapsed) .hitl-sidebar-chevron {
+    transform: rotate(90deg);
 }
 
 .conversation-reasoning-heading {

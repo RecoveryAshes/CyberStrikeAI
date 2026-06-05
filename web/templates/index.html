@@ -831,6 +831,11 @@
                                             <span id="chat-reasoning-summary" class="conversation-reasoning-summary"></span>
                                         </div>
                                     </div>
+                                    <span class="sidebar-card-chevron conversation-reasoning-chevron" aria-hidden="true">
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                            <path d="M9 18l6-6-6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                        </svg>
+                                    </span>
                                 </button>
                                 <div id="conversation-reasoning-body" class="conversation-reasoning-body" role="region">
                                     <p class="chat-reasoning-panel-hint" data-i18n="chat.reasoningPanelHint">仅 Eino 请求生效，与系统设置中的默认值合并。</p>
@@ -859,7 +864,7 @@
                                 </div>
                             </div>
                             <div class="hitl-sidebar-card hitl-sidebar-collapsed" id="hitl-sidebar-card">
-                                <div class="hitl-sidebar-card-header" onclick="toggleHitlSidebarCard()">
+                                <div class="hitl-sidebar-card-header" id="hitl-sidebar-toggle" role="button" tabindex="0" aria-expanded="false" aria-controls="hitl-sidebar-body" onclick="toggleHitlSidebarCard()" onkeydown="if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); toggleHitlSidebarCard(); }">
                                     <div class="hitl-sidebar-heading">
                                         <span class="hitl-sidebar-icon" aria-hidden="true">
                                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -872,11 +877,11 @@
                                             <span class="hitl-sidebar-subtitle" data-i18n="chat.hitlCardSubtitle">审批与白名单</span>
                                         </div>
                                     </div>
-                                    <div class="hitl-sidebar-header-actions">
-                                        <button type="button" class="hitl-apply-btn" id="hitl-apply-btn" onclick="event.stopPropagation(); window.applyHitlSidebarConfig && window.applyHitlSidebarConfig()">
-                                            <span data-i18n="chat.hitlApply">应用</span>
-                                        </button>
-                                    </div>
+                                    <span class="sidebar-card-chevron hitl-sidebar-chevron" aria-hidden="true">
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                            <path d="M9 18l6-6-6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                                        </svg>
+                                    </span>
                                 </div>
                                 <div class="hitl-sidebar-body" id="hitl-sidebar-body">
                                     <div id="hitl-apply-feedback" class="hitl-apply-feedback" role="status" aria-live="polite"></div>
@@ -893,6 +898,11 @@
                                             <label class="hitl-config-label" for="hitl-sensitive-tools" data-i18n="chat.hitlWhitelistTools">白名单工具（免审批，逗号分隔）</label>
                                             <textarea id="hitl-sensitive-tools" class="hitl-config-textarea" rows="3" spellcheck="false" autocomplete="off" data-i18n="chat.hitlWhitelistPlaceholder" data-i18n-attr="placeholder" placeholder=""></textarea>
                                             <p class="hitl-config-hint" data-i18n="chat.hitlWhitelistHint">每行一个或逗号分隔；与 config 中全局白名单合并展示。</p>
+                                        </div>
+                                        <div class="hitl-config-actions">
+                                            <button type="button" class="hitl-apply-btn" id="hitl-apply-btn" onclick="window.applyHitlSidebarConfig && window.applyHitlSidebarConfig()">
+                                                <span data-i18n="chat.hitlApply">应用</span>
+                                            </button>
                                         </div>
                                     </div>
                                 </div>

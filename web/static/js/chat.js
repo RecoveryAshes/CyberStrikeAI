@@ -423,10 +423,18 @@ if (typeof window !== 'undefined') {
     window.updateHitlStatusUI = updateHitlStatusUI;
 }
 
+function syncHitlSidebarAriaExpanded() {
+    var card = document.getElementById('hitl-sidebar-card');
+    var toggle = document.getElementById('hitl-sidebar-toggle');
+    if (!card || !toggle) return;
+    toggle.setAttribute('aria-expanded', card.classList.contains('hitl-sidebar-collapsed') ? 'false' : 'true');
+}
+
 function toggleHitlSidebarCard() {
     var card = document.getElementById('hitl-sidebar-card');
     if (!card) return;
     card.classList.toggle('hitl-sidebar-collapsed');
+    syncHitlSidebarAriaExpanded();
     try {
         localStorage.setItem('hitl-sidebar-collapsed', card.classList.contains('hitl-sidebar-collapsed') ? '1' : '0');
     } catch (e) {}
@@ -438,6 +446,7 @@ document.addEventListener('DOMContentLoaded', function () {
     if (card && localStorage.getItem('hitl-sidebar-collapsed') === '0') {
         card.classList.remove('hitl-sidebar-collapsed');
     }
+    syncHitlSidebarAriaExpanded();
 });
 
 function getAgentModeLabelForValue(mode) {
