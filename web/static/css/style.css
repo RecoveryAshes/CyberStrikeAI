@@ -14880,6 +14880,10 @@ tr.mcp-stats-tool-row[data-tool-name]:focus-visible {
     position: relative;
     flex-shrink: 0;
 }
+.ws-project-selector-wrapper {
+    position: relative;
+    flex-shrink: 0;
+}
 .ws-agent-mode-wrapper {
     flex-shrink: 0;
 }

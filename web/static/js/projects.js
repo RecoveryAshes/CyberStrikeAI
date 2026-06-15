@@ -1270,12 +1270,18 @@ async function saveProjectModal() {
         return;
     }
     const fromChat = !!window._projectModalFromChat;
+    const fromWebshellConnId = window._projectModalFromWebshellConnId || '';
     window._projectModalFromChat = false;
+    window._projectModalFromWebshellConnId = '';
     closeProjectModal();
     const saved = await res.json();
     await loadProjectsList();
     if (saved.id) {
-        if (fromChat && !editId) {
+        if (fromWebshellConnId && !editId) {
+            if (typeof applyWebshellAiProjectSelection === 'function') {
+                await applyWebshellAiProjectSelection(saved.id);
+            }
+        } else if (fromChat && !editId) {
             await applyChatProjectSelection(saved.id);
         } else {
             await selectProject(saved.id);

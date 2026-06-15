@@ -27,6 +27,9 @@ const WEBSHELL_HISTORY_MAX = 100;
 let webshellClearInProgress = false;
 // AI 助手：按连接 ID 保存对话 ID，便于多轮对话
 let webshellAiConvMap = {};
+// AI 助手：项目绑定（已有对话按 convId，新对话按 connId 草稿）
+let webshellAiProjectByConvId = {};
+let webshellAiDraftProjectByConn = {};
 let webshellAiSending = false;
 let webshellAiAbortController = null; // AbortController for current AI stream
 let webshellAiStreamReader = null;    // Current ReadableStreamDefaultReader
@@ -266,6 +269,7 @@ function wsToggleRolePanel() {
     var isOpen = panel.style.display === 'flex';
     if (isOpen) { wsCloseRolePanel(); return; }
     wsCloseAgentModePanel();
+    wsCloseProjectPanel();
     panel.style.display = 'flex';
 }
 function wsCloseRolePanel() {
@@ -340,6 +344,7 @@ function wsToggleAgentModePanel() {
     var isOpen = panel.style.display === 'flex';
     if (isOpen) { wsCloseAgentModePanel(); return; }
     wsCloseRolePanel();
+    wsCloseProjectPanel();
     panel.style.display = 'flex';
 }
 function wsCloseAgentModePanel() {
@@ -347,10 +352,204 @@ function wsCloseAgentModePanel() {
     if (panel) panel.style.display = 'none';
 }
 
+// ─── WebShell AI 项目选择器（与主「对话」页对齐） ───
+
+function wsProjectT(key, fallback) {
+    if (typeof window.t === 'function') {
+        var v = window.t(key);
+        if (v && v !== key) return v;
+    }
+    return fallback;
+}
+
+function getWebshellAiConvId(conn) {
+    if (!conn || !conn.id) return '';
+    return webshellAiConvMap[conn.id] || '';
+}
+
+function getWebshellAiProjectSelection(conn) {
+    if (!conn || !conn.id) return '';
+    var convId = getWebshellAiConvId(conn);
+    if (convId) return webshellAiProjectByConvId[convId] || '';
+    return webshellAiDraftProjectByConn[conn.id] || '';
+}
+
+function wsSetWebshellAiProject(conn, projectId) {
+    if (!conn || !conn.id) return;
+    var pid = projectId || '';
+    var convId = getWebshellAiConvId(conn);
+    if (convId) {
+        if (pid) webshellAiProjectByConvId[convId] = pid;
+        else delete webshellAiProjectByConvId[convId];
+    } else if (pid) {
+        webshellAiDraftProjectByConn[conn.id] = pid;
+    } else {
+        delete webshellAiDraftProjectByConn[conn.id];
+    }
+    wsUpdateProjectButtonLabel();
+}
+
+function wsIsActiveProjectId(id) {
+    if (!id) return false;
+    var map = window.projectNameById || {};
+    return !!map[id];
+}
+
+function wsResolveWebshellAiProjectSelection(conn) {
+    var raw = getWebshellAiProjectSelection(conn);
+    if (!raw) return '';
+    return wsIsActiveProjectId(raw) ? raw : '';
+}
+
+function wsUpdateProjectButtonLabel() {
+    var textEl = document.getElementById('ws-project-text');
+    if (!textEl || !webshellCurrentConn) return;
+    var id = wsResolveWebshellAiProjectSelection(webshellCurrentConn);
+    var nameMap = window.projectNameById || {};
+    textEl.textContent = id && nameMap[id] ? nameMap[id] : wsProjectT('projects.noProject', '无项目');
+}
+
+async function wsRenderProjectPanelList() {
+    var list = document.getElementById('ws-project-list');
+    if (!list || !webshellCurrentConn) return;
+    var conn = webshellCurrentConn;
+    var selected = wsResolveWebshellAiProjectSelection(conn);
+    var projects = [];
+    try {
+        if (typeof window.fetchAllProjects === 'function') {
+            projects = await window.fetchAllProjects(false);
+        }
+    } catch (e) {
+        list.innerHTML = '<div class="chat-project-panel-empty">' + escapeHtml(wsProjectT('projects.loadFailedRetry', '加载失败，请重试')) + '</div>';
+        return;
+    }
+    if (typeof window.rebuildProjectNameMap === 'function') {
+        window.rebuildProjectNameMap(projects);
+    }
+    var activeProjects = projects.filter(function (p) { return p.status !== 'archived'; });
+    var items = [{ id: '', name: wsProjectT('projects.noProject', '无项目'), description: wsProjectT('projects.noProjectDescription', '不绑定项目') }].concat(activeProjects);
+    list.innerHTML = '';
+    items.forEach(function (p) {
+        var isNone = !p.id;
+        var isSelected = isNone ? !selected : selected === p.id;
+        var desc = isNone
+            ? (p.description || '')
+            : ((p.description || '').trim().slice(0, 80) || wsProjectT('projects.sharedFactBoard', '共享事实黑板'));
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'role-selection-item-main' + (isSelected ? ' selected' : '');
+        btn.setAttribute('role', 'option');
+        btn.onclick = function () { wsSelectProject(p.id || ''); };
+        btn.innerHTML = '<div class="role-selection-item-icon-main">' + (isNone ? '—' : '📁') + '</div>' +
+            '<div class="role-selection-item-content-main">' +
+            '<div class="role-selection-item-name-main">' + escapeHtml(p.name || '未命名') + '</div>' +
+            '<div class="role-selection-item-description-main">' + escapeHtml(desc) + '</div></div>' +
+            (isSelected ? '<div class="role-selection-checkmark-main">✓</div>' : '');
+        list.appendChild(btn);
+    });
+}
+
+async function wsRenderProjectPanel() {
+    var list = document.getElementById('ws-project-list');
+    if (!list) return;
+    list.innerHTML = '<div class="chat-project-panel-loading">' + escapeHtml(wsProjectT('common.loading', '加载中...')) + '</div>';
+    await wsRenderProjectPanelList();
+}
+
+function wsCloseProjectPanel() {
+    var panel = document.getElementById('ws-project-panel');
+    var btn = document.getElementById('ws-project-btn');
+    if (panel) panel.style.display = 'none';
+    if (btn) {
+        btn.classList.remove('active');
+        btn.setAttribute('aria-expanded', 'false');
+    }
+}
+
+async function wsToggleProjectPanel() {
+    var panel = document.getElementById('ws-project-panel');
+    var btn = document.getElementById('ws-project-btn');
+    if (!panel) return;
+    var isHidden = panel.style.display === 'none' || !panel.style.display;
+    if (!isHidden) {
+        wsCloseProjectPanel();
+        return;
+    }
+    wsCloseRolePanel();
+    wsCloseAgentModePanel();
+    panel.style.display = 'flex';
+    if (btn) {
+        btn.classList.add('active');
+        btn.setAttribute('aria-expanded', 'true');
+    }
+    await wsRenderProjectPanel();
+}
+
+async function wsSelectProject(projectId) {
+    wsCloseProjectPanel();
+    await applyWebshellAiProjectSelection(projectId || '');
+}
+
+async function applyWebshellAiProjectSelection(projectId) {
+    var conn = webshellCurrentConn;
+    if (!conn || !conn.id) return;
+    var prev = getWebshellAiProjectSelection(conn);
+    if (projectId === prev) {
+        wsUpdateProjectButtonLabel();
+        return;
+    }
+    var convId = getWebshellAiConvId(conn);
+    if (convId) {
+        try {
+            var res = await apiFetch('/api/conversations/' + encodeURIComponent(convId) + '/project', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ projectId: projectId }),
+            });
+            if (!res.ok) {
+                var err = await res.json().catch(function () { return {}; });
+                throw new Error(err.error || res.statusText);
+            }
+            wsSetWebshellAiProject(conn, projectId);
+            if (typeof showNotification === 'function') {
+                showNotification(
+                    projectId ? wsProjectT('projects.projectBound', '已绑定项目') : wsProjectT('projects.projectUnbound', '已解除项目绑定'),
+                    'success'
+                );
+            }
+        } catch (e) {
+            console.error(e);
+            alert(wsProjectT('projects.updateProjectBindingFailed', '更新项目绑定失败') + ': ' + (e.message || e));
+            wsUpdateProjectButtonLabel();
+            return;
+        }
+    } else {
+        wsSetWebshellAiProject(conn, projectId);
+    }
+    wsUpdateProjectButtonLabel();
+}
+
+function showNewProjectModalFromWebshellAi() {
+    wsCloseProjectPanel();
+    if (webshellCurrentConn && webshellCurrentConn.id) {
+        window._projectModalFromWebshellConnId = webshellCurrentConn.id;
+    }
+    window._projectModalFromChat = false;
+    if (typeof showNewProjectModal === 'function') showNewProjectModal();
+}
+
+window.applyWebshellAiProjectSelection = applyWebshellAiProjectSelection;
+window.showNewProjectModalFromWebshellAi = showNewProjectModalFromWebshellAi;
+window.wsToggleProjectPanel = wsToggleProjectPanel;
+window.wsCloseProjectPanel = wsCloseProjectPanel;
+
+// ─── end WebShell AI 项目选择器 ───
+
 /** 当 WebShell AI Tab 可见时刷新选择器显示（同步主页可能的更改） */
 function wsRefreshSelectors() {
     wsUpdateRoleSelectorDisplay();
     wsRenderRoleList();
+    wsUpdateProjectButtonLabel();
     var stored = localStorage.getItem('cyberstrike-chat-agent-mode') || 'eino_single';
     if (stored !== 'eino_single' && stored !== 'deep' && stored !== 'plan_execute' && stored !== 'supervisor') {
         stored = 'eino_single';
@@ -369,6 +568,11 @@ document.addEventListener('click', function (e) {
     var modeBtn = document.getElementById('ws-agent-mode-btn');
     if (modePanel && modePanel.style.display !== 'none' && modeBtn && !modePanel.contains(e.target) && !modeBtn.contains(e.target)) {
         wsCloseAgentModePanel();
+    }
+    var projectPanel = document.getElementById('ws-project-panel');
+    var projectBtn = document.getElementById('ws-project-btn');
+    if (projectPanel && projectPanel.style.display !== 'none' && projectBtn && !projectPanel.contains(e.target) && !projectBtn.contains(e.target)) {
+        wsCloseProjectPanel();
     }
 });
 
@@ -1873,6 +2077,7 @@ function webshellAiConvListSelect(conn, convId, messagesContainer, listEl) {
     apiFetch('/api/conversations/' + encodeURIComponent(convId) + '?include_process_details=1', { method: 'GET' })
         .then(function (r) { return r.json(); })
         .then(function (data) {
+            wsSetWebshellAiProject(conn, data.projectId || data.project_id || '');
             messagesContainer.innerHTML = '';
             var list = data.messages || [];
             list.forEach(function (msg) {
@@ -2003,6 +2208,25 @@ function selectWebshell(id, stateReady) {
         '<div id="webshell-ai-messages" class="webshell-ai-messages"></div>' +
         '<div class="webshell-ai-input-area">' +
         '<div class="webshell-ai-selectors-row">' +
+        '<div class="ws-project-selector-wrapper project-selector-wrapper">' +
+        '<button type="button" id="ws-project-btn" class="role-selector-btn" onclick="wsToggleProjectPanel()" aria-label="' + escapeHtml(wsProjectT('projects.chatSelectorButton', '选择项目')) + '" aria-haspopup="listbox" aria-expanded="false" title="' + escapeHtml(wsProjectT('projects.chatSelectorButton', '绑定项目后共享事实黑板（跨对话）')) + '">' +
+        '<span class="role-selector-icon" aria-hidden="true">📁</span>' +
+        '<span id="ws-project-text" class="role-selector-text">' + escapeHtml(wsProjectT('projects.noProject', '无项目')) + '</span>' +
+        '<svg class="role-selector-arrow" width="10" height="10" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>' +
+        '</button>' +
+        '<div id="ws-project-panel" class="role-selection-panel chat-project-panel" style="display:none;" role="listbox">' +
+        '<div class="role-selection-panel-header">' +
+        '<h3 class="role-selection-panel-title">' + escapeHtml(wsProjectT('projects.selectProject', '选择项目')) + '</h3>' +
+        '<button type="button" class="role-selection-panel-close" onclick="wsCloseProjectPanel()" title="' + escapeHtml(wsProjectT('common.close', '关闭')) + '" aria-label="' + escapeHtml(wsProjectT('common.close', '关闭')) + '">' +
+        '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M18 6L6 18M6 6l12 12" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></button>' +
+        '</div>' +
+        '<div class="chat-project-panel-body">' +
+        '<div id="ws-project-list" class="role-selection-list-main"></div>' +
+        '<div class="chat-project-panel-footer">' +
+        '<button type="button" class="role-selection-item-main chat-project-panel-create-btn" onclick="showNewProjectModalFromWebshellAi()">' +
+        '<span class="chat-project-panel-create-icon" aria-hidden="true">+</span>' +
+        '<span class="chat-project-panel-create-label">' + escapeHtml(wsProjectT('projects.newProject', '新建项目')) + '</span>' +
+        '</button></div></div></div></div>' +
         '<div class="ws-role-selector-wrapper">' +
         '<button type="button" class="role-selector-btn ws-role-selector-btn" id="ws-role-selector-btn" onclick="wsToggleRolePanel()">' +
         '<span id="ws-role-selector-icon" class="role-selector-icon">\ud83d\udd35</span>' +
@@ -2174,9 +2398,11 @@ function selectWebshell(id, stateReady) {
     var aiNewConvBtn = document.getElementById('webshell-ai-new-conv');
     var aiConvListEl = document.getElementById('webshell-ai-conv-list');
 
-    // 初始化角色 + 模式选择器
+    // 初始化角色 + 模式 + 项目选择器
     wsLoadRoles();
     wsInitAgentMode();
+    if (typeof prefetchProjectsForChat === 'function') prefetchProjectsForChat();
+    wsUpdateProjectButtonLabel();
     var aiMemoInput = document.getElementById('webshell-ai-memo-input');
     var aiMemoStatus = document.getElementById('webshell-ai-memo-status');
     var aiMemoClearBtn = document.getElementById('webshell-ai-memo-clear');
@@ -2225,6 +2451,8 @@ function selectWebshell(id, stateReady) {
     if (aiNewConvBtn) {
         aiNewConvBtn.addEventListener('click', function () {
             delete webshellAiConvMap[conn.id];
+            delete webshellAiDraftProjectByConn[conn.id];
+            wsUpdateProjectButtonLabel();
             if (aiMessages) {
                 aiMessages.innerHTML = '';
                 var readyMsg = wsT('webshell.aiSystemReadyMessage') || '系统已就绪。请输入您的测试需求，系统将自动执行相应的安全测试。';
@@ -2767,7 +2995,15 @@ function loadWebshellAiHistory(conn, messagesContainer) {
     return apiFetch('/api/webshell/connections/' + encodeURIComponent(conn.id) + '/ai-history', { method: 'GET' })
         .then(function (r) { return r.json(); })
         .then(function (data) {
-            if (data.conversationId) webshellAiConvMap[conn.id] = data.conversationId;
+            if (data.conversationId) {
+                webshellAiConvMap[conn.id] = data.conversationId;
+                apiFetch('/api/conversations/' + encodeURIComponent(data.conversationId), { method: 'GET' })
+                    .then(function (r) { return r.ok ? r.json() : null; })
+                    .then(function (conv) {
+                        if (conv) wsSetWebshellAiProject(conn, conv.projectId || conv.project_id || '');
+                    })
+                    .catch(function () { /* ignore */ });
+            }
             var list = Array.isArray(data.messages) ? data.messages : [];
             list.forEach(function (msg) {
                 var role = (msg.role || '').toLowerCase();
@@ -2922,6 +3158,10 @@ function runWebshellAiSend(conn, inputEl, sendBtn, messagesContainer) {
         conversationId: convId,
         role: wsRole
     };
+    if (!convId) {
+        var wsPid = getWebshellAiProjectSelection(conn);
+        if (wsPid) body.projectId = wsPid;
+    }
 
     // 流式输出：支持 progress 实时更新、response 打字机效果；若后端发送多段 response 则追加
     var streamingTarget = '';  // 当前要打字显示的目标全文（用于打字机效果）
@@ -2970,6 +3210,11 @@ function runWebshellAiSend(conn, inputEl, sendBtn, messagesContainer) {
 
                     if (_et === 'conversation' && _ed.conversationId) {
                         var convId = _ed.conversationId;
+                        var prevDraft = webshellAiDraftProjectByConn[conn.id];
+                        if (prevDraft) {
+                            webshellAiProjectByConvId[convId] = prevDraft;
+                            delete webshellAiDraftProjectByConn[conn.id];
+                        }
                         webshellAiConvMap[conn.id] = convId;
                         var listEl = document.getElementById('webshell-ai-conv-list');
                         if (listEl) fetchAndRenderWebshellAiConvList(conn, listEl).then(function () {
