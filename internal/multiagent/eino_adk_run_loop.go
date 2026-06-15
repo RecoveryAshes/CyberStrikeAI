@@ -785,6 +785,16 @@ func runEinoADKAgentLoop(ctx context.Context, args *einoADKRunLoopArgs, baseMsgs
 					}
 				}
 			}
+			if progress != nil && reasoningStreamID != "" && strings.TrimSpace(reasoningBuf) != "" {
+				progress("reasoning_chain_stream_end", openai.DisplayReasoningContent(strings.TrimSpace(reasoningBuf)), map[string]interface{}{
+					"streamId":       reasoningStreamID,
+					"conversationId": conversationID,
+					"source":         "eino",
+					"einoAgent":      ev.AgentName,
+					"einoRole":       einoRoleTag(ev.AgentName),
+					"orchestration":  orchMode,
+				})
+			}
 			if streamsMainAssistant(ev.AgentName) {
 				s := strings.TrimSpace(mainAssistantBuf)
 				if mainAssistDupTarget != "" {
