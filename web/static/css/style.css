@@ -22831,6 +22831,7 @@ button.chat-files-dropdown-item:hover:not(:disabled) {
     display: -webkit-box;
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 3;
+    line-clamp: 3;
     overflow: hidden;
 }
 .projects-description-textarea {
