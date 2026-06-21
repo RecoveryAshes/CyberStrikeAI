@@ -366,6 +366,16 @@ func (e *Executor) buildCommandArgs(toolName string, toolConfig *config.ToolConf
 				}
 				continue
 			}
+			if isEmptyCommandParamValue(value) {
+				if param.Required {
+					e.logger.Warn("必需的标志参数为空",
+						zap.String("tool", toolName),
+						zap.String("param", param.Name),
+					)
+					return []string{}
+				}
+				continue
+			}
 
 			// 布尔值特殊处理：如果为 false，跳过；如果为 true，只添加标志
 			if param.Type == "bool" {
@@ -492,6 +502,17 @@ func (e *Executor) buildCommandArgs(toolName string, toolConfig *config.ToolConf
 					}
 					// 只有当值不为 nil 时才添加到命令参数中
 					if value != nil {
+						if isEmptyCommandParamValue(value) {
+							if param.Required {
+								e.logger.Warn("必需的位置参数为空",
+									zap.String("tool", toolName),
+									zap.String("param", param.Name),
+									zap.Int("position", *param.Position),
+								)
+								return []string{}
+							}
+							break
+						}
 						cmdArgs = append(cmdArgs, e.formatParamValue(param, value))
 					}
 					break
@@ -554,6 +575,11 @@ func (e *Executor) buildCommandArgs(toolName string, toolConfig *config.ToolConf
 	}
 
 	return cmdArgs
+}
+
+func isEmptyCommandParamValue(value interface{}) bool {
+	str, ok := value.(string)
+	return ok && strings.TrimSpace(str) == ""
 }
 
 // parseAdditionalArgs 解析 additional_args 字符串，按空格分割但保留引号内的内容

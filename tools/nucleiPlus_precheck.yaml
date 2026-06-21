@@ -1,0 +1,116 @@
+name: "nucleiPlus_precheck"
+command: "python3"
+args:
+  - "tools/scripts/nucleiPlus_wrapper.py"
+  - "--scan-mode"
+  - "precheck"
+enabled: true
+short_description: "受限版 ddddPro 预检：仅做 HTTP 状态响应和被动指纹识别，强制关闭主动探测、nuclei POC 与爆破。"
+description: |
+  `nucleiPlus_precheck` 是目标预检调度专用工具，复用 ddddPro 受限 wrapper，但固定 `scan_mode=precheck`。
+
+  固定行为：
+  - 仅做 HTTP 状态/响应和被动 Web 指纹/技术栈识别
+  - 强制关闭主动目录/Web 指纹探测（ddddPro `-nd`）
+  - 强制关闭 nuclei POC / 漏洞探测（ddddPro `-npoc`）
+  - 强制关闭 GoPoc（`-ngp`）
+  - 强制关闭爆破（`-nb`）
+  - 强制关闭 HostBind 资产扩展（`-nhb`）
+  - 不暴露 Quake/FOFA/ZoomEye/Hunter 等测绘参数
+  - 不暴露子域名枚举参数
+  - 不暴露 masscan / SYN 扫描参数
+
+  使用边界：
+  - 只用于批量目标预检、状态码/响应确认、指纹识别和后续分组
+  - 不用于漏洞验证、POC 探测或漏洞记录
+  - 如果需要在渗透测试阶段做 nuclei 模板/POC 扫描，请使用 `nucleiPlus`
+  - 如果目标直连不是 200 或请求异常，代理只能用于 `http-framework-test` 单点二次验证，禁止用代理跑本工具
+parameters:
+  - name: "urls"
+    type: "array"
+    item_type: "string"
+    description: "URL 列表。每项必须显式包含 http:// 或 https://。支持 JSON 数组。"
+    required: false
+    flag: "--urls"
+  - name: "http_services"
+    type: "array"
+    item_type: "string"
+    description: "HTTP 服务列表，每项必须是 ip:port。适合传入已被 nmap 识别为 HTTP 的服务。"
+    required: false
+    flag: "--http-services"
+  - name: "finger_yaml"
+    type: "string"
+    description: "自定义 finger.yaml 路径。"
+    required: false
+    flag: "--finger-yaml"
+  - name: "dir_yaml"
+    type: "string"
+    description: "自定义 dir.yaml 路径。precheck 模式已强制关闭主动目录/Web 指纹探测，该参数通常不应使用。"
+    required: false
+    flag: "--dir-yaml"
+  - name: "web_threads"
+    type: "int"
+    description: "Web 探针线程数。"
+    required: false
+    flag: "--web-threads"
+  - name: "web_timeout"
+    type: "int"
+    description: "Web 探针超时秒数。"
+    required: false
+    flag: "--web-timeout"
+  - name: "nmap_threads"
+    type: "int"
+    description: "协议识别线程数。"
+    required: false
+    flag: "--nmap-threads"
+  - name: "nmap_timeout"
+    type: "int"
+    description: "协议识别超时时间秒数。"
+    required: false
+    flag: "--nmap-timeout"
+  - name: "audit_log"
+    type: "bool"
+    description: "是否开启 ddddPro 审计日志。"
+    required: false
+    flag: "--audit-log"
+  - name: "output_name"
+    type: "string"
+    description: "输出文件名前缀。"
+    required: false
+    default: "nucleiPlus_precheck"
+    flag: "--output-name"
+  - name: "conversation_id"
+    type: "string"
+    description: "会话 ID，用于归档输出文件。"
+    required: false
+    flag: "--conversation-id"
+  - name: "relative_dir"
+    type: "string"
+    description: "归档输出子目录。"
+    required: false
+    flag: "--relative-dir"
+  - name: "save_debug_files"
+    type: "bool"
+    description: "是否把目标文件、stdout/stderr、结果文件复制到 chat_uploads debug 目录。"
+    required: false
+    flag: "--save-debug-files"
+  - name: "process_timeout"
+    type: "int"
+    description: "wrapper 对每个 ddddPro 批次子进程的超时秒数。默认 1800。"
+    required: false
+    flag: "--process-timeout"
+  - name: "batch_size"
+    type: "int"
+    description: "每批目标数量，默认 30。URL 和 HTTP 服务合并后按该数量分批。"
+    required: false
+    flag: "--batch-size"
+  - name: "max_targets"
+    type: "int"
+    description: "单次调用允许的最大目标数，默认 500；超过会拒绝执行，避免长时间卡死。"
+    required: false
+    flag: "--max-targets"
+  - name: "continue_on_error"
+    type: "string"
+    description: "某批失败后是否继续后续批次，默认 true。可填 true/false。"
+    required: false
+    flag: "--continue-on-error"

@@ -1,0 +1,145 @@
+name: "icp_query"
+command: "python3"
+args:
+  - "tools/scripts/icp_query_wrapper.py"
+enabled: true
+short_description: "批量查询 ICP 备案记录；同会话追加到 icp_query.results.csv。"
+description: "调用 ICP Query CLI 查询中国 ICP 备案信息。调用本工具前必须先遵循 `icp-query` skill 的前置参数规范。关键约束：`items` 和 `input_file` 必须二选一；如果查询项来自当前对话，优先使用 `items`；禁止传空字符串、空白或 `-` 作为 `input_file`；除非已知精确有效路径，否则不要传 `config`，留空时自动使用当前环境中的默认 config。不要猜测配置路径。支持按主体名正查、按域名反查、web/app/mapp/kapp/all 类型、对外投资子公司扩展、断点续跑。启用 investment 时 wrapper 会先展开输入母公司的子公司，再把母公司和子公司作为独立主体逐个查 ICP，不依赖母公司 ICP 是否命中。默认单主体失败 10 次就跳过并在 CSV 记录 failed，总失败 200 次停止本批次。默认只把同会话追加结果 CSV 保存到 chat_uploads/YYYYMMDD/<conversation_id>/tool_outputs/icp_query/icp_query.results.csv；运行日志、checkpoint、单次原始 CSV 放到 CYBERSTRIKE_TOOL_TMP_DIR/icp_query 或 /tmp/cyberstrike-ai-tools/icp_query。"
+parameters:
+  - name: "items"
+    type: "array"
+    item_type: "string"
+    description: "查询项列表。query_mode=subject 时填公司/单位主体名；query_mode=domain 时填域名。与 input_file 二选一。当前对话里直接给出的查询项优先放这里。"
+    required: false
+    flag: "--items"
+  - name: "input_file"
+    type: "string"
+    description: "已有输入文件路径，一行一个查询项。与 items 二选一。仅在确实有现成文件时使用；不要传空字符串、空白或 `-`。"
+    required: false
+    flag: "--input-file"
+    omit_if_empty: true
+  - name: "config"
+    type: "string"
+    description: "ICP CLI 配置文件路径。除非已知当前环境中的精确有效路径，否则不要传该参数；留空时自动使用当前环境里的 icp_querycli/config.json。"
+    required: false
+    flag: "--config"
+    omit_if_empty: true
+  - name: "output_name"
+    type: "string"
+    description: "扫描批次名前缀，用于 query_id 和 /tmp 调试目录；不会改变会话级 CSV 文件名。"
+    required: false
+    flag: "--output-name"
+  - name: "conversation_id"
+    type: "string"
+    description: "会话 ID，用于把结果归档到文件管理对应目录；不确定时可留空，默认 _manual。"
+    required: false
+    flag: "--conversation-id"
+  - name: "relative_dir"
+    type: "string"
+    description: "可选的输出子目录名，用于同一会话下区分任务批次。"
+    required: false
+    flag: "--relative-dir"
+  - name: "query_mode"
+    type: "string"
+    description: "查询模式：subject 按主体名查询；domain 按域名反查。"
+    required: false
+    default: "subject"
+    flag: "--query-mode"
+    options: ["subject", "domain"]
+  - name: "query_type"
+    type: "string"
+    description: "查询类型：web/app/mapp/kapp/all。domain 模式只能使用 web。"
+    required: false
+    default: "web"
+    flag: "--query-type"
+    options: ["web", "app", "mapp", "kapp", "all"]
+  - name: "icp_path"
+    type: "string"
+    description: "ICP 查询链路。默认使用 professional_member；除非用户明确要求或环境不支持，否则不要回退到 default。"
+    required: false
+    default: "professional_member"
+    flag: "--icp-path"
+    options: ["default", "professional_member"]
+  - name: "investment"
+    type: "bool"
+    description: "是否启用对外投资/子公司扩展查询。启用后 wrapper 先展开子公司，再将母公司和子公司合并为独立主体逐个查 ICP；即使母公司 ICP 未命中也会查子公司。"
+    required: false
+    flag: "--investment"
+  - name: "conprop"
+    type: "int"
+    description: "对子公司按控股比例过滤，100 表示全资，51 表示控股 51% 及以上，0 表示不过滤。"
+    required: false
+    flag: "--conprop"
+  - name: "timeout"
+    type: "int"
+    description: "单请求超时时间，单位秒。"
+    required: false
+    flag: "--timeout"
+  - name: "max_retries"
+    type: "int"
+    description: "ICP CLI 内部单次请求/业务失败最大重试次数；未传时 wrapper 使用 item_max_failures，默认 10。"
+    required: false
+    flag: "--max-retries"
+  - name: "page_size"
+    type: "int"
+    description: "分页大小。"
+    required: false
+    flag: "--page-size"
+  - name: "delay_per_key"
+    type: "string"
+    description: "每个 API key 的请求间隔秒数，可填 2 或 0.5。"
+    required: false
+    flag: "--delay-per-key"
+  - name: "smart_mode"
+    type: "string"
+    description: "是否启用智能纠错：true/false。需要 ICP CLI 配置中 MCP/AI 服务可用。"
+    required: false
+    flag: "--smart-mode"
+  - name: "debug"
+    type: "bool"
+    description: "是否开启调试输出。"
+    required: false
+    flag: "--debug"
+  - name: "professional_member_rps"
+    type: "string"
+    description: "professional_member 链路的请求速率。"
+    required: false
+    flag: "--professional-member-rps"
+  - name: "professional_member_mode"
+    type: "string"
+    description: "professional_member 执行模式。"
+    required: false
+    flag: "--professional-member-mode"
+    options: ["pipeline", "serial"]
+  - name: "pipeline"
+    type: "bool"
+    description: "是否启用流水线模式。"
+    required: false
+    flag: "--pipeline"
+  - name: "workers"
+    type: "int"
+    description: "并发 worker 数。"
+    required: false
+    flag: "--workers"
+  - name: "save_debug_files"
+    type: "bool"
+    description: "是否把单次原始 CSV、checkpoint、日志也复制到文件管理 debug 目录。默认 false，只保留追加结果 CSV；临时文件在 CYBERSTRIKE_TOOL_TMP_DIR/icp_query 或 /tmp/cyberstrike-ai-tools/icp_query。"
+    required: false
+    flag: "--save-debug-files"
+  - name: "item_max_failures"
+    type: "int"
+    description: "单个主体/域名最多失败次数，默认 10；达到后写入一条 query_status=failed 的 CSV 记录并继续下一个。"
+    required: false
+    default: 10
+    flag: "--item-max-failures"
+  - name: "total_max_failures"
+    type: "int"
+    description: "本批次累计失败次数上限，默认 200；达到后停止本批次。"
+    required: false
+    default: 200
+    flag: "--total-max-failures"
+  - name: "process_timeout"
+    type: "int"
+    description: "wrapper 对单次 ICP CLI 子进程的超时秒数；用于兜底防止 CLI 卡死。未传时根据 timeout 自动估算，默认 180 秒。"
+    required: false
+    flag: "--process-timeout"

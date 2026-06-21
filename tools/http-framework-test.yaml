@@ -4,6 +4,7 @@ args:
   - "-c"
   - |
     import argparse
+    import inspect
     import json
     import os
     import re
@@ -43,6 +44,9 @@ args:
         "http_code",
         "redirects",
     ]
+    DEFAULT_RESPONSE_MAX_LINES = 80
+    DEFAULT_RESPONSE_MAX_BYTES = 8192
+    DEFAULT_BODY_CAPTURE_MAX_BYTES = 1048576
 
 
     def parse_headers(raw: str) -> List[Tuple[str, str]]:
@@ -102,9 +106,39 @@ args:
         for token in tokens:
             if "=" in token:
                 key, value = token.split("=", 1)
-                options[key.strip()] = value.strip()
+                normalized_key = key.strip().lstrip("-").replace("-", "_")
+                if normalized_key:
+                    options[normalized_key] = value.strip()
             else:
-                options[token.strip()] = "true"
+                normalized_key = token.strip().lstrip("-").replace("-", "_")
+                if normalized_key:
+                    options[normalized_key] = "true"
+        return options
+
+
+    def parse_passthrough_options(tokens: List[str]) -> Dict[str, str]:
+        options: Dict[str, str] = {}
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if not token.startswith("-"):
+                i += 1
+                continue
+            key_value = token.lstrip("-")
+            if "=" in key_value:
+                key, value = key_value.split("=", 1)
+                normalized_key = key.strip().replace("-", "_")
+                if normalized_key:
+                    options[normalized_key] = value.strip()
+                i += 1
+                continue
+            normalized_key = key_value.strip().replace("-", "_")
+            if i + 1 < len(tokens) and not tokens[i + 1].startswith("-"):
+                options[normalized_key] = tokens[i + 1]
+                i += 2
+            else:
+                options[normalized_key] = "true"
+                i += 1
         return options
 
 
@@ -425,7 +459,29 @@ args:
         return min(values), total / count, max(values)
 
 
-    def render_request_overview(method: str, url: str, headers: httpx.Headers, body_meta: Dict[str, str]):
+    def is_valid_header_name(name: str) -> bool:
+        if not name:
+            return False
+        return re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", name) is not None
+
+
+    def sanitize_headers(header_pairs: List[Tuple[str, str]]) -> Tuple[List[Tuple[str, str]], List[str]]:
+        clean: List[Tuple[str, str]] = []
+        skipped: List[str] = []
+        for key, value in header_pairs:
+            key = str(key or "").strip()
+            value = str(value or "").strip()
+            if not is_valid_header_name(key):
+                skipped.append(key[:80] if key else "<empty>")
+                continue
+            if "\r" in value or "\n" in value:
+                skipped.append(key)
+                continue
+            clean.append((key, value))
+        return clean, skipped
+
+
+    def render_request_overview(method: str, url: str, headers: httpx.Headers, body_meta: Dict[str, str], skipped_headers: List[str] = None):
         items = list(headers.items())
         print("\n===== Prepared Request =====")
         print(f"Method: {method}")
@@ -433,6 +489,8 @@ args:
         print(f"Headers ({len(items)} total):")
         for key, value in items:
             print(f"  {key}: {value}")
+        if skipped_headers:
+            print(f"Skipped invalid headers ({len(skipped_headers)}): {', '.join(skipped_headers[:5])}")
         if body_meta["length"]:
             charset = body_meta.get("charset") or "n/a"
             print(f"Body: {body_meta['length']} bytes ({body_meta['mode']}, charset={charset}, source={body_meta['source']})")
@@ -492,12 +550,22 @@ args:
         return "\n".join(chunks)
 
 
+    def cap_line_text(line: str, max_bytes: int) -> Tuple[str, bool]:
+        if max_bytes <= 0 or not line:
+            return line, False
+        capped, truncated = truncate_utf8(line, max_bytes)
+        if truncated:
+            capped = capped + f"\n  [... line truncated to {max_bytes} bytes; use download/body_capture_max_bytes for full body ...]"
+        return capped, truncated
+
+
     def filter_body_by_lines(
         lines: List[str],
         compiled: "re.Pattern",
         invert: bool,
         context_lines: int,
         max_lines: int,
+        max_bytes: int,
     ) -> Tuple[str, Dict[str, object]]:
         matched_nums = []
         for idx, line in enumerate(lines, start=1):
@@ -518,11 +586,25 @@ args:
         if not matched_nums:
             return "", meta
         display_nums = expand_line_context(matched_nums, total, context_lines)
-        entries = [(n, lines[n - 1]) for n in display_nums]
+        per_line_bytes = max_bytes if max_bytes > 0 else 0
+        entries = []
+        line_byte_capped = False
+        for n in display_nums:
+            line, capped = cap_line_text(lines[n - 1], per_line_bytes)
+            entries.append((n, line))
+            line_byte_capped = line_byte_capped or capped
         entries, line_capped = cap_line_entries(entries, max_lines)
         meta["truncated"] = line_capped
+        meta["line_byte_truncated"] = line_byte_capped
         meta["display_lines"] = len(entries)
-        return format_line_entries(lines, [n for n, _ in entries], ellipsis_gaps=context_lines > 0), meta
+        chunks = []
+        prev = None
+        for n, line in entries:
+            if context_lines > 0 and prev is not None and n > prev + 1:
+                chunks.append("  ...")
+            chunks.append(f"  L{n}: {line}")
+            prev = n
+        return "\n".join(chunks), meta
 
 
     def filter_body_multiline(
@@ -613,7 +695,7 @@ args:
         if filter_pattern:
             compiled = compiled_filter or compile_response_filter(filter_pattern, filter_ignore_case)
             if mode == "line":
-                output, meta = filter_body_by_lines(lines, compiled, filter_invert, context_lines, max_lines)
+                output, meta = filter_body_by_lines(lines, compiled, filter_invert, context_lines, max_lines, max_bytes)
             else:
                 output, meta = filter_body_multiline(text, compiled, filter_invert, max_lines, dotall=(mode == "full"))
             meta["filter_pattern"] = filter_pattern
@@ -644,6 +726,8 @@ args:
         if mode == "empty":
             return
         parts = [f"mode={mode}"]
+        if meta.get("download_suppressed"):
+            parts.append("stdout body omitted because --download was used")
         if meta.get("filter_pattern"):
             parts.append(f"pattern={meta['filter_pattern']!r}")
         if meta.get("invert"):
@@ -661,7 +745,48 @@ args:
             parts.append("line cap applied")
         if meta.get("byte_truncated"):
             parts.append("byte cap applied")
+        if meta.get("capture_truncated"):
+            parts.append(f"captured {meta.get('captured_bytes')} of {meta.get('size_download')} bytes for stdout analysis")
         print(f"[body] {' | '.join(parts)}")
+
+
+    def configure_proxy(client_kwargs: Dict[str, object], proxy_url: str):
+        if not proxy_url:
+            return
+        try:
+            params = inspect.signature(httpx.Client).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "proxy" in params:
+            client_kwargs["proxy"] = proxy_url
+        else:
+            client_kwargs["proxies"] = proxy_url
+
+
+    def classify_http_error(exc: Exception, url: str) -> str:
+        text = str(exc)
+        parsed = urllib.parse.urlsplit(url)
+        host = parsed.hostname or ""
+        lowered = text.lower()
+        hints = []
+        if isinstance(exc, httpx.ConnectTimeout) or isinstance(exc, httpx.ReadTimeout) or "timed out" in lowered or "timeout" in lowered:
+            hints.append("category=timeout; increase timeout/retry, or verify WAF/proxy latency")
+        if isinstance(exc, httpx.ProxyError) or "proxy" in lowered:
+            hints.append("category=proxy; verify proxy scheme, credentials, and short-lived IP validity")
+        if isinstance(exc, httpx.ConnectError):
+            if "name or service not known" in lowered or "temporary failure in name resolution" in lowered or "nodename nor servname" in lowered:
+                hints.append("category=dns; host did not resolve")
+            elif "connection reset" in lowered or "connection reset by peer" in lowered:
+                hints.append("category=connection-reset; peer/WAF closed the connection")
+            elif "connection refused" in lowered:
+                hints.append("category=connection-refused; port is closed or filtered")
+        if isinstance(exc, httpx.ConnectError) and host:
+            labels = [part for part in host.split(".") if part]
+            if len(host) <= 6 or len(labels) < 2 or any(len(part) == 1 for part in labels):
+                hints.append(f"hint=host looks suspicious/truncated ({host!r}); verify the URL")
+        if not hints:
+            return ""
+        return "\n".join(f"[error] {hint}" for hint in hints)
 
 
     def main():
@@ -696,24 +821,30 @@ args:
         parser.add_argument("--no-response-filter-invert", dest="response_filter_invert", action="store_false")
         parser.add_argument("--response-filter-ignore-case", dest="response_filter_ignore_case", action="store_true")
         parser.add_argument("--no-response-filter-ignore-case", dest="response_filter_ignore_case", action="store_false")
-        parser.add_argument("--response-max-lines", dest="response_max_lines", type=int, default=0)
-        parser.add_argument("--response-max-bytes", dest="response_max_bytes", type=int, default=0)
+        parser.add_argument("--response-max-lines", dest="response_max_lines", type=int, default=DEFAULT_RESPONSE_MAX_LINES)
+        parser.add_argument("--response-max-bytes", dest="response_max_bytes", type=int, default=DEFAULT_RESPONSE_MAX_BYTES)
         parser.add_argument("--response-preview-lines", dest="response_preview_lines", type=int, default=5)
         parser.add_argument("--response-context-lines", dest="response_context_lines", type=int, default=0)
         parser.set_defaults(
-            include_headers=False,
-            auto_encode_url=False,
+            include_headers=True,
+            auto_encode_url=True,
             follow_redirects=False,
             allow_insecure=False,
             verbose_output=False,
-            show_command=False,
-            show_summary=False,
+            show_command=True,
+            show_summary=True,
             debug=False,
             response_filter_invert=False,
             response_filter_ignore_case=False,
         )
-        args = parser.parse_args()
+        args, passthrough_options = parser.parse_known_args()
 
+        argv_flags = {item.split("=", 1)[0] for item in sys.argv[1:] if item.startswith("--")}
+        explicit_response_limit = bool(
+            "--response-filter" in argv_flags
+            or "--response-max-lines" in argv_flags
+            or "--response-max-bytes" in argv_flags
+        )
         response_filter = (args.response_filter or "").strip()
         response_max_lines = max(0, args.response_max_lines or 0)
         response_max_bytes = max(0, args.response_max_bytes or 0)
@@ -759,6 +890,7 @@ args:
             else:
                 # 非 JSON 格式，使用原有的字符串解析逻辑（向后兼容）
                 headers_list = parse_headers(headers_str)
+        headers_list, skipped_headers = sanitize_headers(headers_list)
         headers = httpx.Headers(headers_list)
         if args.user_agent:
             headers["User-Agent"] = args.user_agent
@@ -783,6 +915,15 @@ args:
             cookie_jar.set(name, value)
 
         additional_options = parse_additional_options(args.additional_args)
+        if passthrough_options:
+            additional_options.update(parse_passthrough_options(passthrough_options))
+        body_capture_max_bytes = DEFAULT_BODY_CAPTURE_MAX_BYTES
+        if "body_capture_max_bytes" in additional_options:
+            try:
+                body_capture_max_bytes = max(0, int(additional_options["body_capture_max_bytes"]))
+            except ValueError:
+                body_capture_max_bytes = DEFAULT_BODY_CAPTURE_MAX_BYTES
+        print_download_body = str_to_bool(additional_options.get("print_download_body", "false"))
 
         timeout_value = None
         if args.timeout:
@@ -799,7 +940,7 @@ args:
             "cookies": cookie_jar,
         }
         if args.proxy:
-            client_kwargs["proxies"] = args.proxy
+            configure_proxy(client_kwargs, args.proxy)
         if "http2" in additional_options:
             client_kwargs["http2"] = str_to_bool(additional_options["http2"])
         if "cert" in additional_options:
@@ -817,7 +958,7 @@ args:
             client_kwargs["trust_env"] = str_to_bool(additional_options["trust_env"])
 
         if args.show_command:
-            render_request_overview(method, prepared_url, headers, body_meta)
+            render_request_overview(method, prepared_url, headers, body_meta, skipped_headers)
 
         aggregate = None
         if args.show_summary:
@@ -858,59 +999,118 @@ args:
                         metrics["redirects"] = len(response.history)
                         http_version = response.http_version or "HTTP/1.1"
 
-                        for chunk in response.iter_bytes():
-                            if first_byte_time is None:
-                                first_byte_time = time.perf_counter()
-                            body_buffer.extend(chunk)
+                        download_target = (args.download or "").strip()
+                        download_filename = ""
+                        download_error = ""
+                        download_fh = None
+                        downloaded_bytes = 0
+                        if download_target:
+                            if repeat > 1 and "{i}" in download_target:
+                                download_filename = download_target.format(i=run_index + 1)
+                            else:
+                                download_filename = download_target
+                            try:
+                                if os.path.dirname(download_filename):
+                                    os.makedirs(os.path.dirname(download_filename), exist_ok=True)
+                                download_fh = open(download_filename, "wb")
+                            except OSError as exc:
+                                download_error = str(exc)
+
+                        total_body_bytes = 0
+                        body_capture_truncated = False
+                        try:
+                            for chunk in response.iter_bytes():
+                                if first_byte_time is None:
+                                    first_byte_time = time.perf_counter()
+                                total_body_bytes += len(chunk)
+                                if download_fh is not None:
+                                    try:
+                                        download_fh.write(chunk)
+                                        downloaded_bytes += len(chunk)
+                                    except OSError as exc:
+                                        download_error = str(exc)
+                                        try:
+                                            download_fh.close()
+                                        except OSError:
+                                            pass
+                                        download_fh = None
+                                if body_capture_max_bytes == 0:
+                                    body_buffer.extend(chunk)
+                                elif len(body_buffer) < body_capture_max_bytes:
+                                    remaining = body_capture_max_bytes - len(body_buffer)
+                                    body_buffer.extend(chunk[:remaining])
+                                    if len(chunk) > remaining:
+                                        body_capture_truncated = True
+                                else:
+                                    body_capture_truncated = True
+                        finally:
+                            if download_fh is not None:
+                                try:
+                                    download_fh.close()
+                                except OSError as exc:
+                                    if not download_error:
+                                        download_error = str(exc)
 
                         total_elapsed = time.perf_counter() - start
                         metrics["total"] = total_elapsed
                         metrics["ttfb"] = (first_byte_time - start) if first_byte_time else total_elapsed
-                        metrics["size_download"] = len(body_buffer)
-                        metrics["speed_download"] = (len(body_buffer) / total_elapsed) if total_elapsed > 0 else 0.0
+                        metrics["size_download"] = total_body_bytes
+                        metrics["speed_download"] = (total_body_bytes / total_elapsed) if total_elapsed > 0 else 0.0
                         if metrics.get("pretransfer") is None:
                             metrics["pretransfer"] = (metrics.get("dns_lookup") or 0.0) + (metrics.get("tcp_connect") or 0.0) + (metrics.get("tls_handshake") or 0.0)
 
                         decoded_body, used_encoding, encoding_source = decode_body_bytes(bytes(body_buffer), response.headers, args.response_encoding)
 
                         print(f"\n===== Response #{run_index + 1} =====")
-                        download_target = (args.download or "").strip()
                         if download_target:
-                            # 支持多次请求时通过 {i} 占位符区分文件名
-                            if repeat > 1 and "{i}" in download_target:
-                                filename = download_target.format(i=run_index + 1)
+                            if download_error:
+                                print(f"[failed to save response body to {download_filename}: {download_error}]", file=sys.stderr)
                             else:
-                                filename = download_target
-                            try:
-                                if os.path.dirname(filename):
-                                    os.makedirs(os.path.dirname(filename), exist_ok=True)
-                                with open(filename, "wb") as fh:
-                                    fh.write(body_buffer)
-                                print(f"[saved response body to file: {filename}]")
-                            except OSError as exc:
-                                print(f"[failed to save response body to {filename}: {exc}]", file=sys.stderr)
+                                print(f"[saved response body to file: {download_filename} ({downloaded_bytes} bytes)]")
                         if args.include_headers:
                             status_line = f"{http_version} {status_code} {response.reason_phrase}"
                             print(status_line)
                             for key, value in response.headers.items():
                                 print(f"{key}: {value}")
                             print("")
-                        output_body, body_output_meta = format_response_body_output(
-                            decoded_body,
-                            response_filter,
-                            args.response_filter_mode,
-                            args.response_filter_invert,
-                            args.response_filter_ignore_case,
-                            response_max_lines,
-                            response_max_bytes,
-                            response_preview_lines,
-                            response_context_lines,
-                            compiled_filter=compiled_response_filter,
+                        suppress_download_body = bool(
+                            download_target
+                            and not print_download_body
+                            and not response_filter
+                            and not explicit_response_limit
                         )
+                        if suppress_download_body:
+                            output_body = ""
+                            body_output_meta = {
+                                "mode": "download",
+                                "total_lines": 0,
+                                "matched_lines": 0,
+                                "display_lines": 0,
+                                "truncated": False,
+                                "byte_truncated": False,
+                                "download_suppressed": True,
+                            }
+                        else:
+                            output_body, body_output_meta = format_response_body_output(
+                                decoded_body,
+                                response_filter,
+                                args.response_filter_mode,
+                                args.response_filter_invert,
+                                args.response_filter_ignore_case,
+                                response_max_lines,
+                                response_max_bytes,
+                                response_preview_lines,
+                                response_context_lines,
+                                compiled_filter=compiled_response_filter,
+                            )
+                        if body_capture_truncated:
+                            body_output_meta["capture_truncated"] = True
+                            body_output_meta["captured_bytes"] = len(body_buffer)
+                            body_output_meta["size_download"] = total_body_bytes
                         has_filter_or_cap = bool(
                             response_filter or response_max_lines > 0 or response_max_bytes > 0
                         )
-                        if has_filter_or_cap and body_output_meta.get("mode") != "empty":
+                        if (has_filter_or_cap or body_output_meta.get("download_suppressed")) and body_output_meta.get("mode") != "empty":
                             print_response_body_summary(body_output_meta)
                             if body_output_meta.get("preview") and not body_output_meta.get("matched_lines"):
                                 print("[body] no regex match; showing preview:")
@@ -922,6 +1122,8 @@ args:
                                 )
                                 if omitted > 0:
                                     print(f"[body] ... {omitted} more line(s) omitted (use --download for full body)")
+                        elif body_output_meta.get("download_suppressed"):
+                            print("[body] omitted from stdout; full body saved to download target")
                         elif body_output_meta.get("mode") == "empty":
                             print("[no body]")
                         elif response_filter and not body_output_meta.get("preview"):
@@ -930,6 +1132,15 @@ args:
                             print("[no body]")
 
                         print(f"\n----- Meta #{run_index + 1} -----")
+                        print(f"Body Bytes Downloaded: {total_body_bytes}")
+                        content_length_header = response.headers.get("Content-Length", "")
+                        if content_length_header and content_length_header.isdigit():
+                            print(f"Body Length: {content_length_header} bytes (source=content-length)")
+                        elif content_length_header:
+                            print(f"Body Length: {total_body_bytes} bytes (source=downloaded; content-length={content_length_header!r})")
+                        else:
+                            print(f"Body Length: {total_body_bytes} bytes (source=downloaded)")
+                        print(f"Body Bytes Captured For Stdout: {len(body_buffer)}")
                         if args.show_summary:
                             for key in METRIC_KEYS:
                                 label = key.replace("_", " ").title()
@@ -960,6 +1171,9 @@ args:
                     elapsed = time.perf_counter() - start
                     print(f"\n===== Response #{run_index + 1} =====")
                     print(f"Request failed after {elapsed:.6f}s: {exc}")
+                    hint = classify_http_error(exc, prepared_url)
+                    if hint:
+                        print(hint)
                     continue
 
             if aggregate and repeat > 1:
@@ -1146,15 +1360,13 @@ parameters:
     flag: "--response-filter-ignore-case"
   - name: "response_max_lines"
     type: "int"
-    description: "stdout 最多输出行数（0=不限制）；有 filter 时限制命中行数，无 filter 时截断全文"
+    description: "stdout 最多输出行数（未提供时脚本默认 80；0=不限制）；有 filter 时限制命中行数，无 filter 时截断全文"
     required: false
-    default: 0
     flag: "--response-max-lines"
   - name: "response_max_bytes"
     type: "int"
-    description: "stdout 响应体 UTF-8 字节上限（0=不限制），超出部分截断"
+    description: "stdout 响应体 UTF-8 字节上限（未提供时脚本默认 8192；0=不限制），超出部分截断"
     required: false
-    default: 0
     flag: "--response-max-bytes"
   - name: "response_preview_lines"
     type: "int"

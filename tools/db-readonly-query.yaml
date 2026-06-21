@@ -1,0 +1,60 @@
+name: "db_readonly_query"
+command: "python3"
+args:
+  - "tools/scripts/db_readonly_query.py"
+enabled: true
+require_explicit_role: true
+short_description: "只读查询项目 SQLite 数据库（conversations/knowledge），默认返回 schema。"
+description: |
+  只读查询 CyberStrikeAI 自身 SQLite 数据库的工具。该工具只能打开本项目内置数据库：
+  - conversations: data/conversations.db
+  - knowledge: data/knowledge.db
+
+  安全限制：
+  - SQLite 连接使用只读 mode=ro。
+  - SQL 只允许 SELECT、WITH SELECT、EXPLAIN SELECT。
+  - 运行时 authorizer 拒绝 INSERT/UPDATE/DELETE/DDL/ATTACH/PRAGMA/事务等写入或危险操作。
+  - 运行时 authorizer 拒绝 load_extension/writefile 等危险函数。
+  - 默认最多返回 50 行，最多 200 行；长字段会截断。
+
+  使用建议：
+  - 仅给只读审计角色显式绑定；默认/全工具角色不会暴露该工具，避免普通渗透/执行角色读取内部数据库。
+  - 不确定表结构时，先不传 query，查看 schema。
+  - 查询会话、消息、工具执行记录、知识库索引等内部状态时使用。
+  - 避免把数据库中的密钥、令牌、代理凭据等敏感内容完整展示给用户，除非用户明确要求且确有必要。
+parameters:
+  - name: "database"
+    type: "string"
+    description: "数据库别名：conversations 查询 data/conversations.db；knowledge 查询 data/knowledge.db。默认 conversations。"
+    required: false
+    default: "conversations"
+    flag: "--database"
+    options: ["conversations", "knowledge"]
+  - name: "query"
+    type: "string"
+    description: "只读 SQL。仅允许 SELECT、WITH SELECT、EXPLAIN SELECT；留空时返回 sqlite_master schema。"
+    required: false
+    flag: "--query"
+  - name: "params_json"
+    type: "string"
+    description: "可选 SQLite 参数 JSON，支持数组（对应 ? 占位符）或对象（对应 :name 占位符）。示例：[\"conversation-id\"] 或 {\"id\":\"...\"}。"
+    required: false
+    flag: "--params-json"
+  - name: "max_rows"
+    type: "int"
+    description: "最多返回行数，范围 1-200，默认 50。"
+    required: false
+    default: 50
+    flag: "--max-rows"
+  - name: "max_cell_chars"
+    type: "int"
+    description: "单个字段最多返回字符数，范围 100-20000，默认 4000。"
+    required: false
+    default: 4000
+    flag: "--max-cell-chars"
+  - name: "timeout_seconds"
+    type: "int"
+    description: "查询超时秒数，范围 1-30，默认 5。"
+    required: false
+    default: 5
+    flag: "--timeout-seconds"

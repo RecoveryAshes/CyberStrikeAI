@@ -1,0 +1,48 @@
+name: "proxy_fetch"
+command: "python3"
+args:
+  - "tools/scripts/proxy_fetch_wrapper.py"
+enabled: true
+short_description: "获取短时低带宽代理地址，默认支持快代理 DPS，返回可直接给 AI/工具使用的完整代理 URL。"
+description: "获取短时代理地址，仅适合单点 HTTP/浏览器验证、一次性重试或确认当前出口 IP 是否被拦截。当前代理约 2 Mbps、有效期通常 1-5 分钟，不适合扫描、目录爆破、nuclei/ddddPro、批量爬虫、端口扫描或任何长时间/高并发任务。当前 provider 支持 kuaidaili_dps，配置来源为环境变量 KDL_SECRET_ID/KDL_SECRET_KEY 等或 JSON config。默认在响应和临时 JSON 中返回/保存带账号密码的完整代理 URL，供 AI 和后续工具直接使用；不要把 KDL_SECRET_ID/KDL_SECRET_KEY 写入 YAML 或角色 prompt。"
+parameters:
+  - name: "provider"
+    type: "string"
+    description: "代理服务商。当前支持 kuaidaili_dps。"
+    required: false
+    default: "kuaidaili_dps"
+    flag: "--provider"
+    options: ["kuaidaili_dps"]
+  - name: "config"
+    type: "string"
+    description: "可选 JSON 配置路径。通常留空，使用环境变量 KDL_* 或默认配置。不要猜测路径。"
+    required: false
+    flag: "--config"
+    omit_if_empty: true
+  - name: "num"
+    type: "int"
+    description: "获取代理数量，1-50。默认 1；短时单点验证通常只取 1 个。"
+    required: false
+    default: 1
+    flag: "--num"
+  - name: "conversation_id"
+    type: "string"
+    description: "会话 ID，用于保存 CSV 到文件管理目录。"
+    required: false
+    flag: "--conversation-id"
+  - name: "relative_dir"
+    type: "string"
+    description: "可选输出子目录。"
+    required: false
+    flag: "--relative-dir"
+  - name: "save_to_file"
+    type: "bool"
+    description: "是否把代理记录追加保存到文件管理 CSV。默认 false；开启后 CSV 会包含完整代理 URL，便于 AI/后续工具读取。"
+    required: false
+    flag: "--save-to-file"
+  - name: "include_secret_in_response"
+    type: "bool"
+    description: "是否在响应中返回完整代理 URL（可能包含账号密码）。默认 true；proxy_fetch 本来就是给 AI/后续工具使用的短时代理。"
+    required: false
+    default: true
+    flag: "--include-secret-in-response"

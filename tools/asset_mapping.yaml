@@ -1,0 +1,70 @@
+name: "asset_mapping"
+command: "python3"
+args:
+  - "tools/scripts/asset_mapping_wrapper.py"
+enabled: true
+short_description: "Quake + ZoomEye 聚合测绘：只接受裸域名和 IP，自动查询、规范化、去重并输出 URL/HTTP 服务清单。"
+description: |
+  受控资产测绘聚合工具。内部调用 Quake 和 ZoomEye，但不暴露原始 DSL，只允许输入：
+  1. `domains`：裸域名，如 `example.com`
+  2. `ips`：单个 IP，如 `1.1.1.1`
+
+  调用本工具前必须先遵循 `asset-mapping` skill 的前置约束。
+
+  **固定行为：**
+  - 对每个 domain 自动构造 Quake `domain:"..."` 和 ZoomEye `domain="..."`
+  - 对每个 ip 自动构造 Quake `ip:"..."` 和 ZoomEye `ip="..."`
+  - 默认查询 Quake + ZoomEye；如果某个引擎未配置 API Key 会自动跳过，除非 `engines` 显式只选择该引擎
+  - 规范化字段：host、ip、port、url、scheme、service、title、domain、sources
+  - 按 URL 或 ip/host:port 去重合并
+  - 输出会话级结果文件到 `chat_uploads/YYYYMMDD/<conversation_id>/tool_outputs/asset_mapping/`
+
+  **输出文件：**
+  - `asset_mapping.assets.jsonl`：规范化后的资产明细
+  - `asset_mapping.urls.txt`：可直接传给 nucleiPlus 的 URL 清单
+  - `asset_mapping.http_services.txt`：可进入端口/服务联动的 host/ip:port 清单
+  - `asset_mapping.raw.json`：原始引擎响应归档
+  - `asset_mapping.summary.json`：统计摘要
+  - `asset_mapping.report.html`：HTML 表格报告
+
+parameters:
+  - name: "domains"
+    type: "array"
+    item_type: "string"
+    description: "裸域名列表。只允许 example.com 这类域名，不允许 URL、路径、端口、CIDR 或原始 DSL。"
+    required: false
+    flag: "--domains"
+  - name: "ips"
+    type: "array"
+    item_type: "string"
+    description: "单个 IP 列表。只允许 IP，不允许 CIDR、范围、端口或 URL。"
+    required: false
+    flag: "--ips"
+  - name: "size"
+    type: "int"
+    description: "每个输入、每个引擎最多返回的结果数。默认 20，wrapper 最大限制 100。"
+    required: false
+    default: 20
+    flag: "--size"
+  - name: "engines"
+    type: "string"
+    description: "启用的测绘引擎，默认 auto。可填 auto、quake、zoomeye 或 quake,zoomeye；auto 会跳过未配置 API Key 的引擎。"
+    required: false
+    default: "auto"
+    flag: "--engines"
+  - name: "timeout"
+    type: "int"
+    description: "单个 API 请求超时秒数，默认 30。"
+    required: false
+    default: 30
+    flag: "--timeout"
+  - name: "conversation_id"
+    type: "string"
+    description: "会话 ID，用于归档输出文件。"
+    required: false
+    flag: "--conversation-id"
+  - name: "relative_dir"
+    type: "string"
+    description: "归档输出子目录。"
+    required: false
+    flag: "--relative-dir"
