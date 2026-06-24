@@ -5,7 +5,7 @@ args: ["-sT", "-sV", "-sC"]
 enabled: true
 short_description: "网络扫描：端口/服务/脚本；可选时序、自定义 NSE、OS 检测（需 root）"
 description: |
-  网络映射与端口扫描。
+  Nmap 服务识别与脚本枚举工具。本项目中不要把 nmap 作为未知端口的大范围发现工具；未知端口发现应先用 `streaming_port_scan` 或 `masscan`，nmap 只用于已经确认开放的端口。
 
   **默认行为（只传 target/ports 即可）：**
   - `-sT` TCP 连接扫描（无需 root）
@@ -20,8 +20,10 @@ description: |
   - `scan_type`：若传入则**整段替换**上述默认 `-sT -sV -sC`，需自行写上需要的选项（如 `-sT -sV`）
 
   **注意事项：**
+  - 默认端到端端口扫描请优先使用 `streaming_port_scan`
+  - 只有端口已经由 masscan/streaming_port_scan 确认为 open，或用户明确给出已知开放端口时，才直接调用本工具
   - `-sS` SYN 扫描需要 root；无 root 请用默认或 `-sT`
-  - 扫描全端口 `1-65535` 非常慢，建议先常用端口
+  - 不要用本工具直接扫描未知全端口 `1-65535`；先让 masscan 确认开放端口
   - 请确保有权限扫描目标
 parameters:
   - name: "target"
@@ -36,7 +38,8 @@ parameters:
   - name: "ports"
     type: "string"
     description: |
-      端口范围。示例：`80`、`1-1000`、`80,443,8080`、`1-65535`（全端口很慢）
+      已确认开放或用户明确指定的端口列表。示例：`80`、`80,443,8080`。
+      不要把未知全端口范围 `1-65535` 直接传给 nmap；先用 `streaming_port_scan`/`masscan` 做开放端口确认。
     required: false
     flag: "-p"
     format: "flag"

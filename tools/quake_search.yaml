@@ -7,6 +7,7 @@ args:
     import json
     import requests
     import os
+    import re
 
     # ==================== Quake配置 ====================
     # 请在此处配置您的Quake API Token
@@ -17,6 +18,26 @@ args:
 
     # Quake API基础URL
     base_url = "https://quake.360.cn/api/v3/search/quake_service"
+
+    def read_config_value(section, key):
+        try:
+            config_path = os.path.join(os.getcwd(), "config.yaml")
+            with open(config_path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            return ""
+        try:
+            import yaml
+            data = yaml.safe_load(text) or {}
+            value = data.get(section, {}).get(key, "")
+            return str(value or "").strip()
+        except Exception:
+            pattern = rf"(?ms)^{re.escape(section)}:\s*\n(?P<body>(?:^[ \t]+.*\n?)*)"
+            match = re.search(pattern, text)
+            if not match:
+                return ""
+            key_match = re.search(rf"(?m)^[ \t]+{re.escape(key)}:\s*[\"']?([^\"'\n#]+)", match.group("body"))
+            return key_match.group(1).strip() if key_match else ""
 
     # 解析参数（从JSON字符串或命令行参数）
     def parse_args():
@@ -88,7 +109,7 @@ args:
             print(json.dumps(error_result, ensure_ascii=False, indent=2))
             sys.exit(1)
 
-        api_key = os.getenv("QUAKE_API_KEY", QUAKE_API_KEY).strip()
+        api_key = os.getenv("QUAKE_API_KEY", "").strip() or read_config_value("quake", "api_key") or QUAKE_API_KEY.strip()
         query = str(config.get("query", "")).strip()
 
         if not api_key:
@@ -212,7 +233,7 @@ args:
         }
         print(json.dumps(error_result, ensure_ascii=False, indent=2))
         sys.exit(1)
-enabled: false
+enabled: true
 short_description: "Quake网络空间搜索接口，支持自定义query、size、fields"
 description: |
   Quake（360 网络空间测绘）资产搜索工具，调用 Quake API v3 实时检索互联网资产。

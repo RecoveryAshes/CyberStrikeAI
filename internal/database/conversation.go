@@ -546,6 +546,22 @@ func (db *DB) UpdateConversationTitle(id, title string) error {
 	return nil
 }
 
+// UpdateConversationTitleIfCurrent updates the title only when it still matches currentTitle.
+func (db *DB) UpdateConversationTitleIfCurrent(id, currentTitle, nextTitle string) (bool, error) {
+	result, err := db.Exec(
+		"UPDATE conversations SET title = ? WHERE id = ? AND title = ?",
+		nextTitle, id, currentTitle,
+	)
+	if err != nil {
+		return false, fmt.Errorf("更新对话标题失败: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("读取对话标题更新结果失败: %w", err)
+	}
+	return rows > 0, nil
+}
+
 // UpdateConversationTime 更新对话时间
 func (db *DB) UpdateConversationTime(id string) error {
 	_, err := db.Exec(

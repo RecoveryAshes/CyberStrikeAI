@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sync"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -204,6 +204,18 @@ func (db *DB) initTables() error {
 		data TEXT,
 		created_at DATETIME NOT NULL,
 		FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+		FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+	);`
+
+	createAgentRuntimeSessionsTable := `
+	CREATE TABLE IF NOT EXISTS agent_runtime_sessions (
+		conversation_id TEXT PRIMARY KEY,
+		runtime_session_id TEXT NOT NULL,
+		last_turn_id TEXT,
+		active_turn_id TEXT,
+		state_summary TEXT,
+		created_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL,
 		FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 	);`
 
@@ -582,6 +594,7 @@ func (db *DB) initTables() error {
 	CREATE INDEX IF NOT EXISTS idx_conversations_updated_at ON conversations(updated_at);
 	CREATE INDEX IF NOT EXISTS idx_process_details_message_id ON process_details(message_id);
 	CREATE INDEX IF NOT EXISTS idx_process_details_conversation_id ON process_details(conversation_id);
+	CREATE INDEX IF NOT EXISTS idx_agent_runtime_sessions_updated_at ON agent_runtime_sessions(updated_at);
 	CREATE INDEX IF NOT EXISTS idx_tool_executions_tool_name ON tool_executions(tool_name);
 	CREATE INDEX IF NOT EXISTS idx_tool_executions_start_time ON tool_executions(start_time);
 	CREATE INDEX IF NOT EXISTS idx_tool_executions_status ON tool_executions(status);
@@ -646,6 +659,14 @@ func (db *DB) initTables() error {
 
 	if _, err := db.Exec(createProcessDetailsTable); err != nil {
 		return fmt.Errorf("创建process_details表失败: %w", err)
+	}
+
+	if _, err := db.Exec(createAgentRuntimeSessionsTable); err != nil {
+		return fmt.Errorf("创建agent_runtime_sessions表失败: %w", err)
+	}
+
+	if err := db.migrateLegacyAgentRuntimeSessions(); err != nil {
+		return fmt.Errorf("迁移agent_runtime_sessions表失败: %w", err)
 	}
 
 	if _, err := db.Exec(createToolExecutionsTable); err != nil {

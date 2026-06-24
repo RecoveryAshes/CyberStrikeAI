@@ -65,6 +65,49 @@ func TestApplyReasoningOff_disablesThinking(t *testing.T) {
 	}
 }
 
+func TestClientEffortEnablesReasoningWhenServerModeOff(t *testing.T) {
+	cfg := &einoopenai.ChatModelConfig{}
+	allow := true
+	oa := &config.OpenAIConfig{
+		BaseURL: "https://api.openai.com/v1",
+		Model:   "gpt-5-codex",
+		Reasoning: config.OpenAIReasoningConfig{
+			Profile:              "openai_compat",
+			Mode:                 "off",
+			AllowClientReasoning: &allow,
+		},
+	}
+	ApplyToEinoChatModelConfig(cfg, oa, &ClientIntent{Effort: "xhigh"})
+	if th, ok := cfg.ExtraFields["thinking"].(map[string]any); ok && th["type"] == "disabled" {
+		t.Fatalf("client effort must not be disabled by server mode off, got %#v", cfg.ExtraFields)
+	}
+	if got, _ := cfg.ExtraFields["reasoning_effort"].(string); got != "xhigh" {
+		t.Fatalf("reasoning_effort=%q, want xhigh", got)
+	}
+}
+
+func TestClientEffortIgnoredWhenClientReasoningDisabled(t *testing.T) {
+	cfg := &einoopenai.ChatModelConfig{}
+	allow := false
+	oa := &config.OpenAIConfig{
+		BaseURL: "https://api.openai.com/v1",
+		Model:   "gpt-5-codex",
+		Reasoning: config.OpenAIReasoningConfig{
+			Profile:              "openai_compat",
+			Mode:                 "off",
+			AllowClientReasoning: &allow,
+		},
+	}
+	ApplyToEinoChatModelConfig(cfg, oa, &ClientIntent{Effort: "xhigh"})
+	th, ok := cfg.ExtraFields["thinking"].(map[string]any)
+	if !ok || th["type"] != "disabled" {
+		t.Fatalf("expected admin mode off to disable thinking, got %#v", cfg.ExtraFields)
+	}
+	if got, _ := cfg.ExtraFields["reasoning_effort"].(string); got != "" {
+		t.Fatalf("client effort should be ignored when disabled, got %q", got)
+	}
+}
+
 func TestApplyOpenAICompat_maxPassthrough(t *testing.T) {
 	cfg := &einoopenai.ChatModelConfig{}
 	oa := &config.OpenAIConfig{

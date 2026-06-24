@@ -419,8 +419,8 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 						},
 						"agentMode": map[string]interface{}{
 							"type":        "string",
-							"description": "代理模式：eino_single（Eino ADK 单代理，默认）| deep | plan_execute | supervisor",
-							"enum":        []string{"eino_single", "deep", "plan_execute", "supervisor"},
+							"description": "代理模式：eino_single（Eino ADK 单代理，默认）| agent_runtime（独立 Rust Runtime）| deep | plan_execute | supervisor",
+							"enum":        []string{"eino_single", "agent_runtime", "deep", "plan_execute", "supervisor"},
 						},
 						"scheduleMode": map[string]interface{}{
 							"type":        "string",
@@ -794,18 +794,18 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 					"type":        "object",
 					"description": "视觉分析（analyze_image MCP 工具）；enabled 且 model 非空时注册工具",
 					"properties": map[string]interface{}{
-						"enabled":                      map[string]interface{}{"type": "boolean", "description": "是否启用 analyze_image"},
-						"model":                        map[string]interface{}{"type": "string", "description": "视觉模型名（必填）", "example": "qwen-vl-max"},
-						"api_key":                      map[string]interface{}{"type": "string", "description": "API Key；留空复用 openai.api_key"},
-						"base_url":                     map[string]interface{}{"type": "string", "description": "Base URL；留空复用 openai.base_url"},
-						"provider":                     map[string]interface{}{"type": "string", "description": "提供商；留空复用 openai.provider"},
-						"timeout_seconds":              map[string]interface{}{"type": "integer", "description": "VL 调用超时（秒）"},
-						"max_image_bytes":              map[string]interface{}{"type": "integer", "description": "原始文件大小上限（字节）"},
-						"max_dimension":                map[string]interface{}{"type": "integer", "description": "长边缩放像素"},
-						"jpeg_quality":                 map[string]interface{}{"type": "integer", "description": "JPEG 质量 60-100"},
-						"max_payload_bytes":            map[string]interface{}{"type": "integer", "description": "送 API 体积上限（字节）"},
-						"skip_preprocess_below_bytes":  map[string]interface{}{"type": "integer", "description": "低于该字节且尺寸合规时可原图直传；0=始终压缩"},
-						"detail": map[string]interface{}{"type": "string", "enum": []string{"low", "high", "auto"}, "description": "OpenAI 兼容 image detail"},
+						"enabled":                     map[string]interface{}{"type": "boolean", "description": "是否启用 analyze_image"},
+						"model":                       map[string]interface{}{"type": "string", "description": "视觉模型名（必填）", "example": "qwen-vl-max"},
+						"api_key":                     map[string]interface{}{"type": "string", "description": "API Key；留空复用 openai.api_key"},
+						"base_url":                    map[string]interface{}{"type": "string", "description": "Base URL；留空复用 openai.base_url"},
+						"provider":                    map[string]interface{}{"type": "string", "description": "提供商；留空复用 openai.provider"},
+						"timeout_seconds":             map[string]interface{}{"type": "integer", "description": "VL 调用超时（秒）"},
+						"max_image_bytes":             map[string]interface{}{"type": "integer", "description": "原始文件大小上限（字节）"},
+						"max_dimension":               map[string]interface{}{"type": "integer", "description": "长边缩放像素"},
+						"jpeg_quality":                map[string]interface{}{"type": "integer", "description": "JPEG 质量 60-100"},
+						"max_payload_bytes":           map[string]interface{}{"type": "integer", "description": "送 API 体积上限（字节）"},
+						"skip_preprocess_below_bytes": map[string]interface{}{"type": "integer", "description": "低于该字节且尺寸合规时可原图直传；0=始终压缩"},
+						"detail":                      map[string]interface{}{"type": "string", "enum": []string{"low", "high", "auto"}, "description": "OpenAI 兼容 image detail"},
 					},
 				},
 				"AnalyzeImageToolCall": map[string]interface{}{
@@ -1393,7 +1393,7 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 						{
 							"name": "id", "in": "path", "required": true,
 							"description": "对话ID",
-							"schema": map[string]interface{}{"type": "string"},
+							"schema":      map[string]interface{}{"type": "string"},
 						},
 					},
 					"requestBody": map[string]interface{}{
@@ -1508,6 +1508,46 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 					"responses": map[string]interface{}{
 						"200": map[string]interface{}{
 							"description": "text/event-stream（SSE）",
+							"content": map[string]interface{}{
+								"text/event-stream": map[string]interface{}{
+									"schema": map[string]interface{}{
+										"type":        "string",
+										"description": "SSE 流",
+									},
+								},
+							},
+						},
+						"401": map[string]interface{}{"description": "未授权"},
+					},
+				},
+			},
+			"/api/agent-runtime/stream": map[string]interface{}{
+				"post": map[string]interface{}{
+					"tags":        []string{"对话交互"},
+					"summary":     "发送消息并获取 AI 回复（Agent Runtime，SSE）",
+					"description": "向 AI 发送消息并获取流式回复（SSE）。由独立 Rust Agent Runtime 执行；事件类型与 Eino 单代理流式保持兼容，支持 `response_delta`、`tool_call`、`tool_result`、`planning`、`hitl_approval_requested`、`done` 等。**前提**：`agent_runtime.enabled: true`。",
+					"operationId": "sendMessageAgentRuntimeStream",
+					"requestBody": map[string]interface{}{
+						"required": true,
+						"content": map[string]interface{}{
+							"application/json": map[string]interface{}{
+								"schema": map[string]interface{}{
+									"type": "object",
+									"properties": map[string]interface{}{
+										"message":              map[string]interface{}{"type": "string"},
+										"conversationId":       map[string]interface{}{"type": "string"},
+										"role":                 map[string]interface{}{"type": "string"},
+										"projectId":            map[string]interface{}{"type": "string"},
+										"webshellConnectionId": map[string]interface{}{"type": "string"},
+									},
+									"required": []string{"message"},
+								},
+							},
+						},
+					},
+					"responses": map[string]interface{}{
+						"200": map[string]interface{}{
+							"description": "text/event-stream（SSE）；未启用时返回 error + done 事件",
 							"content": map[string]interface{}{
 								"text/event-stream": map[string]interface{}{
 									"schema": map[string]interface{}{
@@ -2531,7 +2571,7 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 						"content": map[string]interface{}{
 							"application/json": map[string]interface{}{
 								"schema": map[string]interface{}{
-									"type": "object",
+									"type":     "object",
 									"required": []string{"source_fact_key", "target_fact_key", "edge_type"},
 									"properties": map[string]interface{}{
 										"source_fact_key": map[string]interface{}{"type": "string"},
@@ -4783,7 +4823,7 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 									"properties": map[string]interface{}{
 										"title":     map[string]interface{}{"type": "string", "description": "队列标题"},
 										"role":      map[string]interface{}{"type": "string", "description": "使用的角色名称"},
-										"agentMode": map[string]interface{}{"type": "string", "description": "代理模式", "enum": []string{"eino_single", "deep", "plan_execute", "supervisor"}},
+										"agentMode": map[string]interface{}{"type": "string", "description": "代理模式", "enum": []string{"eino_single", "agent_runtime", "deep", "plan_execute", "supervisor"}},
 									},
 								},
 							},
@@ -5125,19 +5165,18 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 				"post": map[string]interface{}{
 					"tags":        []string{"配置管理"},
 					"summary":     "获取模型列表",
-					"description": "代理调用 OpenAI 兼容 GET /models，返回可用模型 id 列表。Claude 不支持。",
+					"description": "后端使用当前 openai.base_url/openai.api_key 代理调用 OpenAI 兼容 GET /models，返回可用模型 id 列表。请求体可选传入 provider/base_url/api_key 临时覆盖。Claude 不支持。",
 					"operationId": "listModels",
 					"requestBody": map[string]interface{}{
-						"required": true,
+						"required": false,
 						"content": map[string]interface{}{
 							"application/json": map[string]interface{}{
 								"schema": map[string]interface{}{
-									"type":     "object",
-									"required": []string{"api_key"},
+									"type": "object",
 									"properties": map[string]interface{}{
-										"provider": map[string]interface{}{"type": "string", "description": "LLM提供商（openai/claude）", "example": "openai"},
-										"base_url": map[string]interface{}{"type": "string", "description": "API基地址（可选）"},
-										"api_key":  map[string]interface{}{"type": "string", "description": "API密钥"},
+										"provider": map[string]interface{}{"type": "string", "description": "临时覆盖 LLM 提供商（openai/claude）", "example": "openai"},
+										"base_url": map[string]interface{}{"type": "string", "description": "临时覆盖 API 基地址；不传则使用当前配置 openai.base_url"},
+										"api_key":  map[string]interface{}{"type": "string", "description": "临时覆盖 API 密钥；不传则使用当前配置 openai.api_key"},
 									},
 								},
 							},

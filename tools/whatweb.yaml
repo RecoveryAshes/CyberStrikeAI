@@ -1,0 +1,81 @@
+name: "whatweb"
+command: "python3"
+args:
+  - "tools/scripts/whatweb_wrapper.py"
+enabled: true
+short_description: "WhatWeb Web 指纹识别工具，用于状态码、标题、服务端、框架和技术栈预检。"
+description: |
+  对一组 Web URL 做低成本指纹识别，用于批量目标预检、框架识别、技术栈归类和后续渗透测试分组。
+
+  固定用途：
+  - 识别 HTTP 状态码、标题、IP、Server、X-Powered-By、重定向和常见响应头
+  - 识别 CMS、Web 框架、前端框架、JS 库、Web server、WAF/CDN 等 WhatWeb 插件命中
+  - 输出 WhatWeb JSON 原始结果和适合子任务引用的简要技术栈摘要
+
+  使用约束：
+  - 默认 aggression=1，属于低噪声预检；不要把本工具当目录爆破或漏洞扫描工具
+  - 代理仅允许用于少量异常目标的单点二次验证，不要用于批量扫描
+  - 如果目标是裸域名或 host:port，wrapper 会默认补 http://；需要 https 时请传完整 URL
+parameters:
+  - name: "urls"
+    type: "array"
+    item_type: "string"
+    description: "待识别 URL 列表。每项建议包含 http:// 或 https://；缺少协议时默认补 http://。支持 JSON 数组。"
+    required: true
+    flag: "--urls"
+  - name: "aggression"
+    type: "int"
+    description: "WhatWeb aggression 级别。默认 1；预检一般保持 1，只有明确需要更强识别时才升到 3。"
+    required: false
+    default: 1
+    flag: "--aggression"
+  - name: "threads"
+    type: "int"
+    description: "WhatWeb 并发线程数。默认 10。"
+    required: false
+    default: 10
+    flag: "--threads"
+  - name: "open_timeout"
+    type: "int"
+    description: "连接超时时间，单位秒。默认 10。"
+    required: false
+    default: 10
+    flag: "--open-timeout"
+  - name: "read_timeout"
+    type: "int"
+    description: "读取超时时间，单位秒。默认 15。"
+    required: false
+    default: 15
+    flag: "--read-timeout"
+  - name: "proxy"
+    type: "string"
+    description: "可选代理，格式 host:port 或 http://host:port；仅用于少量异常目标二次验证，不要用于批量预检。"
+    required: false
+    flag: "--proxy"
+  - name: "user_agent"
+    type: "string"
+    description: "可选 User-Agent。默认使用桌面 Chrome UA；也可由环境变量 WHATWEB_DEFAULT_UA 覆盖 wrapper 默认值。"
+    required: false
+    flag: "--user-agent"
+  - name: "conversation_id"
+    type: "string"
+    description: "会话 ID，用于归档输出文件。"
+    required: false
+    flag: "--conversation-id"
+  - name: "relative_dir"
+    type: "string"
+    description: "归档输出子目录。"
+    required: false
+    flag: "--relative-dir"
+  - name: "output_name"
+    type: "string"
+    description: "输出文件名前缀。默认 whatweb。"
+    required: false
+    default: "whatweb"
+    flag: "--output-name"
+  - name: "save_debug_files"
+    type: "bool"
+    description: "是否保存 WhatWeb JSON、stdout/stderr 和摘要到 chat_uploads。默认 true。"
+    required: false
+    default: true
+    flag: "--save-debug-files"

@@ -168,7 +168,10 @@ function resolveWebshellAiStreamRequest() {
             norm = window.csaiChatAgentMode.normalizeStored(localStorage.getItem('cyberstrike-chat-agent-mode'), cfg);
         } else {
             var mode = localStorage.getItem('cyberstrike-chat-agent-mode');
-            norm = (mode && (mode === 'eino_single' || mode === 'deep' || mode === 'plan_execute' || mode === 'supervisor')) ? mode : 'eino_single';
+            norm = (mode && (mode === 'eino_single' || mode === 'agent_runtime' || mode === 'deep' || mode === 'plan_execute' || mode === 'supervisor')) ? mode : 'eino_single';
+        }
+        if (norm === 'agent_runtime') {
+            return { path: '/api/agent-runtime/stream', orchestration: null };
         }
         if (cfg && cfg.multi_agent && cfg.multi_agent.enabled &&
             typeof window.csaiChatAgentMode === 'object' && typeof window.csaiChatAgentMode.isEino === 'function' && window.csaiChatAgentMode.isEino(norm)) {
@@ -302,7 +305,7 @@ function wsInitAgentMode() {
             norm = window.csaiChatAgentMode.normalizeStored(stored, cfg);
         } else {
             norm = stored || 'eino_single';
-            if (norm !== 'eino_single' && norm !== 'deep' && norm !== 'plan_execute' && norm !== 'supervisor') {
+            if (norm !== 'eino_single' && norm !== 'agent_runtime' && norm !== 'deep' && norm !== 'plan_execute' && norm !== 'supervisor') {
                 norm = 'eino_single';
             }
             if (norm === 'multi') norm = 'deep';
@@ -551,7 +554,7 @@ function wsRefreshSelectors() {
     wsRenderRoleList();
     wsUpdateProjectButtonLabel();
     var stored = localStorage.getItem('cyberstrike-chat-agent-mode') || 'eino_single';
-    if (stored !== 'eino_single' && stored !== 'deep' && stored !== 'plan_execute' && stored !== 'supervisor') {
+    if (stored !== 'eino_single' && stored !== 'agent_runtime' && stored !== 'deep' && stored !== 'plan_execute' && stored !== 'supervisor') {
         stored = 'eino_single';
     }
     wsSyncAgentMode(stored);
@@ -2256,6 +2259,7 @@ function selectWebshell(id, stateReady) {
         '</div>' +
         '<div class="agent-mode-options">' +
         '<button type="button" class="role-selection-item-main agent-mode-option ws-agent-mode-option" data-value="eino_single" role="option" onclick="wsSelectAgentMode(\'eino_single\')"><div class="role-selection-item-icon-main">\u26a1</div><div class="role-selection-item-content-main"><div class="role-selection-item-name-main">' + (wsT('chat.agentModeEinoSingle') || 'Eino 单代理（ADK）') + '</div><div class="role-selection-item-description-main">' + (wsT('chat.agentModeEinoSingleHint') || 'Eino ChatModelAgent + Runner') + '</div></div><div class="role-selection-checkmark-main agent-mode-check" data-agent-mode-check="eino_single">\u2713</div></button>' +
+        '<button type="button" class="role-selection-item-main agent-mode-option ws-agent-mode-option" data-value="agent_runtime" role="option" onclick="wsSelectAgentMode(\'agent_runtime\')"><div class="role-selection-item-icon-main">AR</div><div class="role-selection-item-content-main"><div class="role-selection-item-name-main">' + (wsT('chat.agentModeCodexLabel') || 'Agent Runtime') + '</div><div class="role-selection-item-description-main">' + (wsT('chat.agentModeCodexHint') || '独立 Rust RunLoop') + '</div></div><div class="role-selection-checkmark-main agent-mode-check" data-agent-mode-check="agent_runtime">\u2713</div></button>' +
         '<button type="button" class="role-selection-item-main agent-mode-option ws-agent-mode-option" data-value="deep" role="option" onclick="wsSelectAgentMode(\'deep\')"><div class="role-selection-item-icon-main">\ud83e\udde9</div><div class="role-selection-item-content-main"><div class="role-selection-item-name-main">' + (wsT('chat.agentModeDeep') || 'Deep（DeepAgent）') + '</div><div class="role-selection-item-description-main">' + (wsT('chat.agentModeDeepHint') || 'Eino DeepAgent，task 调度子代理') + '</div></div><div class="role-selection-checkmark-main agent-mode-check" data-agent-mode-check="deep">\u2713</div></button>' +
         '<button type="button" class="role-selection-item-main agent-mode-option ws-agent-mode-option" data-value="plan_execute" role="option" onclick="wsSelectAgentMode(\'plan_execute\')"><div class="role-selection-item-icon-main">\ud83d\udccb</div><div class="role-selection-item-content-main"><div class="role-selection-item-name-main">' + (wsT('chat.agentModePlanExecuteLabel') || 'Plan-Execute') + '</div><div class="role-selection-item-description-main">' + (wsT('chat.agentModePlanExecuteHint') || '规划 → 执行 → 重规划') + '</div></div><div class="role-selection-checkmark-main agent-mode-check" data-agent-mode-check="plan_execute">\u2713</div></button>' +
         '<button type="button" class="role-selection-item-main agent-mode-option ws-agent-mode-option" data-value="supervisor" role="option" onclick="wsSelectAgentMode(\'supervisor\')"><div class="role-selection-item-icon-main">\ud83c\udfaf</div><div class="role-selection-item-content-main"><div class="role-selection-item-name-main">' + (wsT('chat.agentModeSupervisorLabel') || 'Supervisor') + '</div><div class="role-selection-item-description-main">' + (wsT('chat.agentModeSupervisorHint') || '监督者协调，transfer 委派子代理') + '</div></div><div class="role-selection-checkmark-main agent-mode-check" data-agent-mode-check="supervisor">\u2713</div></button>' +

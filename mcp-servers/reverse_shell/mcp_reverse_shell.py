@@ -9,8 +9,6 @@ Reverse Shell MCP Server - 反向 Shell MCP 服务
 运行：python mcp_reverse_shell.py  或  python3 mcp_reverse_shell.py
 """
 
-from __future__ import annotations
-
 import asyncio
 import socket
 import threading

@@ -376,6 +376,20 @@ async function initializeApp() {
         }
     }
 
+    try {
+        const response = await fetch('/api/auth/validate', { method: 'GET' });
+        const result = await response.json().catch(() => ({}));
+        if (response.ok && result && result.auth_disabled && result.token && result.expires_at) {
+            saveAuth(result.token, result.expires_at);
+            hideLoginOverlay();
+            resolveAuthPromises(true);
+            await bootstrapApp();
+            return;
+        }
+    } catch (error) {
+        console.warn('免认证状态检测失败，继续显示登录界面');
+    }
+
     clearAuthStorage();
     showLoginOverlay();
 }

@@ -25,6 +25,10 @@ type multiAgentPrepared struct {
 }
 
 func (h *AgentHandler) prepareMultiAgentSession(req *ChatRequest, c *gin.Context, source string) (*multiAgentPrepared, error) {
+	return h.prepareMultiAgentSessionWithTitlePublisher(req, c, source, nil)
+}
+
+func (h *AgentHandler) prepareMultiAgentSessionWithTitlePublisher(req *ChatRequest, c *gin.Context, source string, publish func(eventType, message string, data interface{})) (*multiAgentPrepared, error) {
 	if len(req.Attachments) > maxAttachments {
 		return nil, fmt.Errorf("附件最多 %d 个", maxAttachments)
 	}
@@ -32,7 +36,7 @@ func (h *AgentHandler) prepareMultiAgentSession(req *ChatRequest, c *gin.Context
 	conversationID := strings.TrimSpace(req.ConversationID)
 	createdNew := false
 	if conversationID == "" {
-		title := safeTruncateString(req.Message, 50)
+		title := "New Chat"
 		var conv *database.Conversation
 		var err error
 		meta := audit.ConversationCreateMetaFromGin(c, source)
@@ -74,8 +78,8 @@ func (h *AgentHandler) prepareMultiAgentSession(req *ChatRequest, c *gin.Context
 			return nil, fmt.Errorf("未找到该 WebShell 连接")
 		}
 		webshellContext := BuildWebshellAssistantContext(conn, WebshellSkillHintMultiAgent, req.Message)
-		// WebShell 模式下如果同时指定了角色，追加角色 user_prompt（工具集仍仅限 webshell 专用工具）
-		if req.Role != "" && req.Role != "默认" && h.config != nil && h.config.Roles != nil {
+		// WebShell 模式下如果同时指定了非默认角色，追加角色 user_prompt（工具集仍仅限 webshell 专用工具）
+		if req.Role != "" && req.Role != defaultRoleName && h.config != nil && h.config.Roles != nil {
 			if role, exists := h.config.Roles[req.Role]; exists && role.Enabled && role.UserPrompt != "" {
 				finalMessage = role.UserPrompt + "\n\n" + webshellContext
 				h.logger.Info("WebShell + 角色: 应用角色提示词（多代理）", zap.String("role", req.Role))
@@ -102,13 +106,8 @@ func (h *AgentHandler) prepareMultiAgentSession(req *ChatRequest, c *gin.Context
 			builtin.ToolListKnowledgeRiskTypes,
 			builtin.ToolSearchKnowledgeBase,
 		}
-	} else if req.Role != "" && req.Role != "默认" && h.config != nil && h.config.Roles != nil {
-		if role, exists := h.config.Roles[req.Role]; exists && role.Enabled {
-			if role.UserPrompt != "" {
-				finalMessage = role.UserPrompt + "\n\n" + req.Message
-			}
-			roleTools = role.Tools
-		}
+	} else {
+		finalMessage, roleTools, _, _ = applyConfiguredRole(h.config, req.Role, req.Message)
 	}
 
 	var savedPaths []string
@@ -131,6 +130,7 @@ func (h *AgentHandler) prepareMultiAgentSession(req *ChatRequest, c *gin.Context
 	if userMsgRow != nil {
 		userMessageID = userMsgRow.ID
 	}
+	h.maybeStartConversationTitleGeneration(conversationID, userContent, publish)
 
 	assistantMsg, aerr := h.db.AddMessage(conversationID, "assistant", "处理中...", nil)
 	var assistantMessageID string

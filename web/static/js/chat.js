@@ -38,11 +38,12 @@ function isInterruptContinueInjectChatMessage(content) {
 let chatAttachments = [];
 let chatAttachmentSeq = 0;
 
-// 对话模式：eino_single = Eino ADK 单代理（/api/eino-agent/stream）；deep / plan_execute / supervisor = Eino 多代理（/api/multi-agent/stream，请求体 orchestration）
+// 对话模式：eino_single = Eino ADK 单代理；agent_runtime = 独立 Rust Agent Runtime；deep / plan_execute / supervisor = Eino 多代理。
 const AGENT_MODE_STORAGE_KEY = 'cyberstrike-chat-agent-mode';
 const REASONING_MODE_LS = 'cyberstrike-chat-reasoning-mode';
 const REASONING_EFFORT_LS = 'cyberstrike-chat-reasoning-effort';
 const CHAT_AGENT_MODE_EINO_SINGLE = 'eino_single';
+const CHAT_AGENT_MODE_AGENT_RUNTIME = 'agent_runtime';
 const CHAT_AGENT_EINO_MODES = ['deep', 'plan_execute', 'supervisor'];
 let multiAgentAPIEnabled = false;
 
@@ -92,6 +93,10 @@ function chatAgentModeIsEino(mode) {
 
 function chatAgentModeIsEinoSingle(mode) {
     return mode === CHAT_AGENT_MODE_EINO_SINGLE;
+}
+
+function chatAgentModeIsAgentRuntime(mode) {
+    return mode === CHAT_AGENT_MODE_AGENT_RUNTIME || mode === 'codex' || mode === 'codex_runtime';
 }
 
 function normalizeHitlMode(mode) {
@@ -390,12 +395,15 @@ async function applyHitlSidebarConfig() {
     }
 }
 
-/** 将 localStorage 规范为 eino_single | deep | plan_execute | supervisor */
+/** 将 localStorage 规范为 eino_single | agent_runtime | deep | plan_execute | supervisor */
 function chatAgentModeNormalizeStored(stored, cfg) {
     const pub = cfg && cfg.multi_agent ? cfg.multi_agent : null;
     const multiOn = !!(pub && pub.enabled);
+    const runtimePub = cfg && (cfg.agent_runtime || cfg.codex_runtime) ? (cfg.agent_runtime || cfg.codex_runtime) : null;
+    const runtimeOn = !!(runtimePub && runtimePub.enabled);
     const s = stored;
     if (chatAgentModeIsEinoSingle(s)) return s;
+    if (chatAgentModeIsAgentRuntime(s)) return runtimeOn ? CHAT_AGENT_MODE_AGENT_RUNTIME : CHAT_AGENT_MODE_EINO_SINGLE;
     if (chatAgentModeIsEino(s)) {
         return multiOn ? s : CHAT_AGENT_MODE_EINO_SINGLE;
     }
@@ -407,8 +415,13 @@ if (typeof window !== 'undefined') {
     window.csaiChatAgentMode = {
         EINO_MODES: CHAT_AGENT_EINO_MODES,
         EINO_SINGLE: CHAT_AGENT_MODE_EINO_SINGLE,
+        AGENT_RUNTIME: CHAT_AGENT_MODE_AGENT_RUNTIME,
+        isAgentRuntime: chatAgentModeIsAgentRuntime,
+        // Deprecated compatibility aliases for older browser code.
+        CODEX: CHAT_AGENT_MODE_AGENT_RUNTIME,
         isEino: chatAgentModeIsEino,
         isEinoSingle: chatAgentModeIsEinoSingle,
+        isCodex: chatAgentModeIsAgentRuntime,
         normalizeStored: chatAgentModeNormalizeStored,
         normalizeOrchestration: normalizeOrchestrationClient
     };
@@ -468,6 +481,8 @@ function getAgentModeLabelForValue(mode) {
                 return window.t('chat.agentModePlanExecuteLabel');
             case 'supervisor':
                 return window.t('chat.agentModeSupervisorLabel');
+            case CHAT_AGENT_MODE_AGENT_RUNTIME:
+                return window.t('chat.agentModeCodexLabel');
             case CHAT_AGENT_MODE_EINO_SINGLE:
                 return window.t('chat.agentModeEinoSingle');
             default:
@@ -476,6 +491,7 @@ function getAgentModeLabelForValue(mode) {
     }
     switch (mode) {
         case CHAT_AGENT_MODE_EINO_SINGLE: return 'Eino 单代理';
+        case CHAT_AGENT_MODE_AGENT_RUNTIME: return 'Agent Runtime';
         case 'deep': return 'Deep';
         case 'plan_execute': return 'Plan-Execute';
         case 'supervisor': return 'Supervisor';
@@ -486,6 +502,7 @@ function getAgentModeLabelForValue(mode) {
 function getAgentModeIconForValue(mode) {
     switch (mode) {
         case CHAT_AGENT_MODE_EINO_SINGLE: return '⚡';
+        case CHAT_AGENT_MODE_AGENT_RUNTIME: return '⌘';
         case 'deep': return '🧩';
         case 'plan_execute': return '📋';
         case 'supervisor': return '🎯';
@@ -494,6 +511,9 @@ function getAgentModeIconForValue(mode) {
 }
 
 function syncAgentModeFromValue(value) {
+    if (chatAgentModeIsAgentRuntime(value)) {
+        value = CHAT_AGENT_MODE_AGENT_RUNTIME;
+    }
     const hid = document.getElementById('agent-mode-select');
     const label = document.getElementById('agent-mode-text');
     const icon = document.getElementById('agent-mode-icon');
@@ -665,8 +685,11 @@ function toggleAgentModePanel() {
 }
 
 function selectAgentMode(mode) {
-    const ok = chatAgentModeIsEinoSingle(mode) || chatAgentModeIsEino(mode);
+    const ok = chatAgentModeIsEinoSingle(mode) || chatAgentModeIsAgentRuntime(mode) || chatAgentModeIsEino(mode);
     if (!ok) return;
+    if (chatAgentModeIsAgentRuntime(mode)) {
+        mode = CHAT_AGENT_MODE_AGENT_RUNTIME;
+    }
     try {
         localStorage.setItem(AGENT_MODE_STORAGE_KEY, mode);
     } catch (e) { /* ignore */ }
@@ -682,14 +705,14 @@ async function initChatAgentModeFromConfig() {
     // 先展示基础模式，避免首次登录时配置接口短暂失败导致入口被隐藏。
     wrap.style.display = '';
     let stored = localStorage.getItem(AGENT_MODE_STORAGE_KEY);
-    if (!(chatAgentModeIsEinoSingle(stored) || chatAgentModeIsEino(stored))) {
+    if (!(chatAgentModeIsEinoSingle(stored) || chatAgentModeIsAgentRuntime(stored) || chatAgentModeIsEino(stored))) {
         stored = CHAT_AGENT_MODE_EINO_SINGLE;
     }
     sel.value = stored;
     syncAgentModeFromValue(stored);
     document.querySelectorAll('.agent-mode-option').forEach(function (el) {
         const v = el.getAttribute('data-value');
-        if (v === 'deep' || v === 'plan_execute' || v === 'supervisor') {
+        if (chatAgentModeIsAgentRuntime(v) || v === 'deep' || v === 'plan_execute' || v === 'supervisor') {
             el.style.display = 'none';
         } else {
             el.style.display = '';
@@ -703,6 +726,7 @@ async function initChatAgentModeFromConfig() {
         if (!r.ok) return;
         const cfg = await r.json();
         multiAgentAPIEnabled = !!(cfg.multi_agent && cfg.multi_agent.enabled);
+        const agentRuntimeEnabled = !!((cfg.agent_runtime || cfg.codex_runtime) && (cfg.agent_runtime || cfg.codex_runtime).enabled);
         if (typeof window !== 'undefined') {
             window.__csaiMultiAgentPublic = cfg.multi_agent || null;
             const tw = cfg.hitl && cfg.hitl.tool_whitelist;
@@ -712,7 +736,9 @@ async function initChatAgentModeFromConfig() {
         }
         document.querySelectorAll('.agent-mode-option').forEach(function (el) {
             const v = el.getAttribute('data-value');
-            if (v === 'deep' || v === 'plan_execute' || v === 'supervisor') {
+            if (chatAgentModeIsAgentRuntime(v)) {
+                el.style.display = agentRuntimeEnabled ? '' : 'none';
+            } else if (v === 'deep' || v === 'plan_execute' || v === 'supervisor') {
                 el.style.display = multiAgentAPIEnabled ? '' : 'none';
             } else {
                 el.style.display = '';
@@ -735,7 +761,7 @@ document.addEventListener('languagechange', function () {
     const hid = document.getElementById('agent-mode-select');
     if (!hid) return;
     const v = hid.value;
-    if (chatAgentModeIsEinoSingle(v) || chatAgentModeIsEino(v)) {
+    if (chatAgentModeIsEinoSingle(v) || chatAgentModeIsAgentRuntime(v) || chatAgentModeIsEino(v)) {
         syncAgentModeFromValue(v);
     }
     if (typeof updateChatReasoningSummary === 'function') {
@@ -956,8 +982,9 @@ async function sendMessage() {
     try {
         const modeSel = document.getElementById('agent-mode-select');
         let modeVal = modeSel ? modeSel.value : CHAT_AGENT_MODE_EINO_SINGLE;
+        const useAgentRuntime = chatAgentModeIsAgentRuntime(modeVal);
         const useMulti = multiAgentAPIEnabled && chatAgentModeIsEino(modeVal);
-        const streamPath = useMulti ? '/api/multi-agent/stream' : '/api/eino-agent/stream';
+        const streamPath = useAgentRuntime ? '/api/agent-runtime/stream' : (useMulti ? '/api/multi-agent/stream' : '/api/eino-agent/stream');
         if (useMulti && modeVal) {
             body.orchestration = modeVal;
         }
@@ -2519,6 +2546,9 @@ function renderProcessDetails(messageId, processDetails) {
             data: data,
             createdAt: detail.createdAt // 传递实际的事件创建时间
         };
+        if (String(timelineOpts.title || '').trim() === String(timelineOpts.message || '').trim()) {
+            timelineOpts.message = '';
+        }
         if (eventType === 'tool_call' && data._mergedResult) {
             timelineOpts.mergedResult = data._mergedResult;
         }

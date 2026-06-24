@@ -5,9 +5,129 @@ args:
   - |
     set -euo pipefail
 
-    SCRIPT_CONTENT="$1"
-    ENV_NAME="${2:-default}"
-    ADDITIONAL_ARGS="${3:-}"
+    SCRIPT_CONTENT=""
+    SCRIPT_PATH=""
+    ENV_NAME="default"
+    ADDITIONAL_ARGS=()
+    POSITIONAL_ARGS=()
+
+    add_python_arg() {
+      case "$1" in
+        -O|-OO|-B|-I|-S|-s|-u)
+          ADDITIONAL_ARGS+=("$1")
+          ;;
+        -W|-X)
+          if [ $# -ge 2 ]; then
+            ADDITIONAL_ARGS+=("$1" "$2")
+          fi
+          ;;
+        -W*|-X*)
+          ADDITIONAL_ARGS+=("$1")
+          ;;
+        *)
+          ;;
+      esac
+    }
+
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --script)
+          if [ $# -lt 2 ]; then
+            echo "execute-python-script argument error: --script requires a value" >&2
+            exit 2
+          fi
+          SCRIPT_CONTENT="$2"
+          shift 2
+          ;;
+        --script-content|--script_content)
+          if [ $# -lt 2 ]; then
+            echo "execute-python-script argument error: --script-content requires a value" >&2
+            exit 2
+          fi
+          SCRIPT_CONTENT="$2"
+          shift 2
+          ;;
+        --script-path|--script_path)
+          if [ $# -lt 2 ]; then
+            echo "execute-python-script argument error: --script-path requires a value" >&2
+            exit 2
+          fi
+          SCRIPT_PATH="$2"
+          shift 2
+          ;;
+        --env-name|--env_name)
+          if [ $# -lt 2 ]; then
+            echo "execute-python-script argument error: --env-name requires a value" >&2
+            exit 2
+          fi
+          ENV_NAME="$2"
+          shift 2
+          ;;
+        --additional-args|--additional_args)
+          if [ $# -lt 2 ]; then
+            echo "execute-python-script argument error: --additional-args requires a value" >&2
+            exit 2
+          fi
+          # shellcheck disable=SC2206
+          parsed_args=($2)
+          for arg in "${parsed_args[@]}"; do
+            add_python_arg "$arg"
+          done
+          shift 2
+          ;;
+        --fallback-reason|--fallback_reason|--justification|--why-generic-tool|--why_generic_tool)
+          if [ $# -ge 2 ]; then
+            shift 2
+          else
+            shift
+          fi
+          ;;
+        -*)
+          if { [ "$1" = "-W" ] || [ "$1" = "-X" ]; } && [ $# -ge 2 ]; then
+            add_python_arg "$1" "$2"
+            shift 2
+          else
+            add_python_arg "$1"
+            shift
+          fi
+          ;;
+        fallback_reason=*|justification=*|why_generic_tool=*)
+          shift
+          ;;
+        *)
+          POSITIONAL_ARGS+=("$1")
+          shift
+          ;;
+      esac
+    done
+
+    if [ -z "$SCRIPT_CONTENT" ] && [ -n "$SCRIPT_PATH" ]; then
+      if [ ! -f "$SCRIPT_PATH" ]; then
+        echo "execute-python-script argument error: script_path not found: $SCRIPT_PATH" >&2
+        exit 2
+      fi
+      SCRIPT_CONTENT="$(cat "$SCRIPT_PATH")"
+    fi
+
+    if [ -z "$SCRIPT_CONTENT" ] && [ "${#POSITIONAL_ARGS[@]}" -gt 0 ]; then
+      if [ "${POSITIONAL_ARGS[0]}" != "default" ]; then
+        SCRIPT_CONTENT="${POSITIONAL_ARGS[0]}"
+      fi
+    fi
+
+    if [ "${#POSITIONAL_ARGS[@]}" -gt 1 ]; then
+      ENV_NAME="${POSITIONAL_ARGS[1]}"
+      for arg in "${POSITIONAL_ARGS[@]:2}"; do
+        add_python_arg "$arg"
+      done
+    elif [ -n "$SCRIPT_PATH" ] && [ "${#POSITIONAL_ARGS[@]}" -gt 0 ] && [ "${POSITIONAL_ARGS[0]}" != "default" ]; then
+      ENV_NAME="${POSITIONAL_ARGS[0]}"
+    fi
+
+    if [ -z "$SCRIPT_CONTENT" ]; then
+      echo "execute-python-script argument error: missing script. Use script, script_content, or script_path." >&2
+      exit 2
+    fi
 
     BASE_DIR="${HOME}/.cyberstrike/venvs"
 
@@ -50,11 +170,76 @@ args:
     # shellcheck disable=SC1090
     source "$ENV_DIR/bin/activate"
 
-    if [ -n "$ADDITIONAL_ARGS" ]; then
-      python3 $ADDITIONAL_ARGS -c "$SCRIPT_CONTENT"
-    else
-      python3 -c "$SCRIPT_CONTENT"
+    module_to_packages() {
+      case "$1" in
+        requests) printf '%s\n' "requests" ;;
+        httpx) printf '%s\n' "httpx" ;;
+        Crypto|Cryptodome) printf '%s\n' "pycryptodome" ;;
+        bs4) printf '%s\n' "beautifulsoup4" ;;
+        yaml) printf '%s\n' "PyYAML" ;;
+        lxml) printf '%s\n' "lxml" ;;
+        jwt) printf '%s\n' "PyJWT" ;;
+        OpenSSL) printf '%s\n' "pyOpenSSL" ;;
+        PIL) printf '%s\n' "Pillow" ;;
+        cryptography) printf '%s\n' "cryptography" ;;
+        dns) printf '%s\n' "dnspython" ;;
+        socks) printf '%s\n' "PySocks" ;;
+        websocket) printf '%s\n' "websocket-client" ;;
+        multipart) printf '%s\n' "python-multipart" ;;
+        dateutil) printf '%s\n' "python-dateutil" ;;
+        aiohttp) printf '%s\n' "aiohttp" ;;
+        selenium) printf '%s\n' "selenium" ;;
+        playwright) printf '%s\n' "playwright" ;;
+        numpy) printf '%s\n' "numpy" ;;
+        pandas) printf '%s\n' "pandas" ;;
+        tqdm) printf '%s\n' "tqdm" ;;
+        colorama) printf '%s\n' "colorama" ;;
+        urllib3) printf '%s\n' "urllib3" ;;
+        chardet) printf '%s\n' "chardet" ;;
+        charset_normalizer) printf '%s\n' "charset-normalizer" ;;
+        *) return 1 ;;
+      esac
+    }
+
+    extract_missing_module() {
+      printf '%s\n' "$1" | sed -n "s/.*ModuleNotFoundError: No module named ['\"]\([^'\"]*\)['\"].*/\1/p" | tail -n 1 | cut -d. -f1
+    }
+
+    run_script() {
+      python3 "${ADDITIONAL_ARGS[@]}" -c "$SCRIPT_CONTENT"
+    }
+
+    set +e
+    OUTPUT="$(run_script 2>&1)"
+    STATUS=$?
+    set -e
+    if [ "$STATUS" -eq 0 ]; then
+      printf '%s\n' "$OUTPUT"
+      exit 0
     fi
+
+    MISSING_MODULE="$(extract_missing_module "$OUTPUT")"
+    if [ -n "$MISSING_MODULE" ]; then
+      if PACKAGES="$(module_to_packages "$MISSING_MODULE")"; then
+        echo "[execute-python-script] Missing Python module '$MISSING_MODULE'; installing package(s): $PACKAGES"
+        python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
+        if python3 -m pip install --disable-pip-version-check -q $PACKAGES; then
+          echo "[execute-python-script] Dependency install completed; retrying script once."
+          set +e
+          OUTPUT="$(run_script 2>&1)"
+          STATUS=$?
+          set -e
+          printf '%s\n' "$OUTPUT"
+          exit "$STATUS"
+        fi
+        echo "[execute-python-script] Dependency install failed for module '$MISSING_MODULE' (package(s): $PACKAGES)." >&2
+      else
+        echo "[execute-python-script] Missing Python module '$MISSING_MODULE' has no trusted auto-install mapping; install it explicitly or use a known package name." >&2
+      fi
+    fi
+
+    printf '%s\n' "$OUTPUT"
+    exit "$STATUS"
   - "_"
 enabled: true
 short_description: "在指定虚拟环境中编写并执行Python脚本"
@@ -81,9 +266,21 @@ parameters:
       for i in range(1, 10):
           print(i)
       ```
-    required: true
+    required: false
     position: 0
     format: "positional"
+  - name: "script_content"
+    type: "string"
+    description: "兼容别名：要执行的 Python 脚本内容。优先使用 script；如果误传 script_content，wrapper 也会执行。"
+    required: false
+    flag: "--script-content"
+    format: "flag"
+  - name: "script_path"
+    type: "string"
+    description: "兼容别名：读取 Parrot 上已有的 Python 脚本文件并执行。文件不存在时返回明确参数错误。"
+    required: false
+    flag: "--script-path"
+    format: "flag"
   - name: "env_name"
     type: "string"
     description: "虚拟环境名称（默认default）"
@@ -94,7 +291,8 @@ parameters:
   - name: "additional_args"
     type: "string"
     description: |
-      额外的execute-python-script参数。用于传递未在参数列表中定义的execute-python-script选项。
+      额外 Python 解释器参数，仅允许安全白名单：-O/-OO/-B/-I/-S/-s/-u/-W/-X。
+      fallback_reason/justification/why_generic_tool 这类说明字段会被忽略，不会传给 Python。
 
       **示例值：**
       - 根据工具特性添加常用参数示例
@@ -106,3 +304,21 @@ parameters:
     required: false
     format: "positional"
     default: ""
+  - name: "fallback_reason"
+    type: "string"
+    description: "通用 Python 兜底原因说明，仅用于审计/提示；wrapper 会忽略，不传给 Python。"
+    required: false
+    flag: "--fallback-reason"
+    format: "flag"
+  - name: "justification"
+    type: "string"
+    description: "通用 Python 兜底说明，仅用于审计/提示；wrapper 会忽略，不传给 Python。"
+    required: false
+    flag: "--justification"
+    format: "flag"
+  - name: "why_generic_tool"
+    type: "string"
+    description: "通用工具使用理由，仅用于审计/提示；wrapper 会忽略，不传给 Python。"
+    required: false
+    flag: "--why-generic-tool"
+    format: "flag"

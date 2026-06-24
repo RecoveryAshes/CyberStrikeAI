@@ -1,0 +1,161 @@
+name: "nucleiPlus"
+command: "python3"
+args:
+  - "tools/scripts/nucleiPlus_wrapper.py"
+enabled: true
+short_description: "受限版 ddddPro：渗透测试阶段对 URL 或 HTTP ip:port 执行指纹联动 nuclei POC 扫描。"
+description: |
+  这是一个对 ddddPro 做过范围收紧的封装工具，只允许两类输入：
+  1. `urls`：显式的 `http://` 或 `https://` URL
+  2. `http_services`：已知为 HTTP 服务的 `ip:port`
+
+  调用本工具前必须先遵循 `nuclei-plus` skill 的前置约束。
+
+  **固定行为：**
+  - 保留 ddddPro 的被动 Web 探测与主动目录/指纹探测
+  - 默认 `scan_mode=vuln_scan`，保留指纹识别 -> workflow -> nuclei 的联动链路
+  - 强制关闭 GoPoc（`-ngp`）
+  - 强制关闭爆破（`-nb`）
+  - 强制关闭 HostBind 资产扩展（`-nhb`）
+  - 不暴露 Quake/FOFA/ZoomEye/Hunter 等测绘参数
+  - 不暴露子域名枚举参数
+  - 不暴露 masscan / SYN 扫描参数
+
+  **重要约束：**
+  - `urls` 和 `http_services` 至少提供一个
+  - `urls` 必须包含 `http://` 或 `https://`
+  - `http_services` 只能是 `ip:port`，不能是 URL
+  - `http_services` 会先走 ddddPro 的协议识别，再由其自动尝试 `http://ip:port` 和 `https://ip:port`
+  - 默认按 `batch_size=30` 分批执行，每批独立受 `process_timeout` 限制
+  - 每批结果会追加合并到会话级 `chat_uploads/YYYYMMDD/<conversation_id>/tool_outputs/nucleiPlus/nucleiPlus.results.txt`
+  - 每批索引会追加写入 `nucleiPlus.runs.jsonl`
+
+  适用于渗透测试阶段：你已经拿到目标 URL 或 nmap 识别出的 HTTP 服务，想做主动/被动指纹识别并联动 nuclei POC 的场景。
+  批量目标预检只需要状态/指纹时，请使用 `nucleiPlus_precheck`，不要使用本工具。
+parameters:
+  - name: "urls"
+    type: "array"
+    item_type: "string"
+    description: "URL 列表。每项必须显式包含 http:// 或 https://。支持 JSON 数组。"
+    required: false
+    flag: "--urls"
+  - name: "http_services"
+    type: "array"
+    item_type: "string"
+    description: "HTTP 服务列表，每项必须是 ip:port。适合传入已被 nmap 识别为 HTTP 的服务。"
+    required: false
+    flag: "--http-services"
+  - name: "scan_mode"
+    type: "string"
+    description: "扫描模式：vuln_scan 允许 nuclei 模板/POC 联动（默认）；precheck 仅状态/指纹并关闭 POC。目标预检调度应使用 nucleiPlus_precheck。"
+    required: false
+    default: "vuln_scan"
+    options:
+      - "vuln_scan"
+      - "precheck"
+    flag: "--scan-mode"
+  - name: "severity"
+    type: "string"
+    description: "限制 nuclei 严重程度，如 critical,high。"
+    required: false
+    flag: "--severity"
+  - name: "exclude_tags"
+    type: "string"
+    description: "排除的 nuclei tags，逗号分隔。"
+    required: false
+    flag: "--exclude-tags"
+  - name: "poc_name"
+    type: "string"
+    description: "按名称模糊匹配 POC；仅运行匹配到的模板。"
+    required: false
+    flag: "--poc-name"
+  - name: "template_dir"
+    type: "string"
+    description: "自定义 nuclei 模板目录。"
+    required: false
+    flag: "--template-dir"
+  - name: "workflow_yaml"
+    type: "string"
+    description: "自定义 workflow.yaml 路径。"
+    required: false
+    flag: "--workflow-yaml"
+  - name: "finger_yaml"
+    type: "string"
+    description: "自定义 finger.yaml 路径。"
+    required: false
+    flag: "--finger-yaml"
+  - name: "dir_yaml"
+    type: "string"
+    description: "自定义 dir.yaml 路径，用于主动目录/指纹探测。"
+    required: false
+    flag: "--dir-yaml"
+  - name: "web_threads"
+    type: "int"
+    description: "Web 探针线程数。"
+    required: false
+    flag: "--web-threads"
+  - name: "web_timeout"
+    type: "int"
+    description: "Web 探针超时秒数。"
+    required: false
+    flag: "--web-timeout"
+  - name: "nmap_threads"
+    type: "int"
+    description: "协议识别线程数。"
+    required: false
+    flag: "--nmap-threads"
+  - name: "nmap_timeout"
+    type: "int"
+    description: "协议识别超时秒数。"
+    required: false
+    flag: "--nmap-timeout"
+  - name: "disable_interactsh"
+    type: "bool"
+    description: "是否禁用 interactsh。"
+    required: false
+    flag: "--disable-interactsh"
+  - name: "audit_log"
+    type: "bool"
+    description: "是否开启 ddddPro 审计日志。"
+    required: false
+    flag: "--audit-log"
+  - name: "output_name"
+    type: "string"
+    description: "输出文件名前缀。"
+    required: false
+    flag: "--output-name"
+  - name: "conversation_id"
+    type: "string"
+    description: "会话 ID，用于归档输出文件。"
+    required: false
+    flag: "--conversation-id"
+  - name: "relative_dir"
+    type: "string"
+    description: "归档输出子目录。"
+    required: false
+    flag: "--relative-dir"
+  - name: "save_debug_files"
+    type: "bool"
+    description: "是否把目标文件、stdout/stderr、结果文件复制到 chat_uploads debug 目录。"
+    required: false
+    flag: "--save-debug-files"
+  - name: "process_timeout"
+    type: "int"
+    description: "wrapper 对每个 ddddPro 批次子进程的超时秒数。默认 1800。"
+    required: false
+    flag: "--process-timeout"
+  - name: "batch_size"
+    type: "int"
+    description: "每批目标数量，默认 30。URL 和 HTTP 服务合并后按该数量分批。"
+    required: false
+    flag: "--batch-size"
+  - name: "max_targets"
+    type: "int"
+    description: "单次调用允许的最大目标数，默认 500；超过会拒绝执行，避免长时间卡死。"
+    required: false
+    flag: "--max-targets"
+  - name: "continue_on_error"
+    type: "string"
+    description: "某批失败后是否继续后续批次，默认 true。可填 true/false。"
+    required: false
+    flag: "--continue-on-error"

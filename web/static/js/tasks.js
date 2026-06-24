@@ -15,7 +15,7 @@ function _tPlain(key, opts) {
 }
 
 /** 与创建队列 / API 一致的合法 agentMode */
-const BATCH_QUEUE_AGENT_MODES = ['eino_single', 'deep', 'plan_execute', 'supervisor'];
+const BATCH_QUEUE_AGENT_MODES = ['eino_single', 'agent_runtime', 'deep', 'plan_execute', 'supervisor'];
 
 function isBatchQueueAgentMode(mode) {
     return BATCH_QUEUE_AGENT_MODES.indexOf(String(mode || '').toLowerCase()) >= 0;
@@ -25,6 +25,7 @@ function isBatchQueueAgentMode(mode) {
 function batchQueueAgentModeLabel(mode) {
     const m = String(mode || 'eino_single').toLowerCase();
     if (m === 'eino_single') return _t('chat.agentModeEinoSingle');
+    if (m === 'agent_runtime') return _t('chat.agentModeCodexLabel');
     if (m === 'deep') return _t('chat.agentModeDeep');
     if (m === 'plan_execute') return _t('chat.agentModePlanExecuteLabel');
     if (m === 'supervisor') return _t('chat.agentModeSupervisorLabel');
@@ -2238,6 +2239,7 @@ function startInlineEditAgentMode() {
         container.innerHTML = `<span class="bq-inline-edit-controls">
             <select id="bq-edit-agentmode">
                 <option value="eino_single" ${currentMode === 'eino_single' ? 'selected' : ''}>${escapeHtml(_t('chat.agentModeEinoSingle'))}</option>
+                <option value="agent_runtime" ${currentMode === 'agent_runtime' ? 'selected' : ''}>${escapeHtml(_t('chat.agentModeCodexLabel'))}</option>
                 <option value="deep" ${currentMode === 'deep' ? 'selected' : ''}>${escapeHtml(_t('chat.agentModeDeep'))}</option>
                 <option value="plan_execute" ${currentMode === 'plan_execute' ? 'selected' : ''}>${escapeHtml(_t('chat.agentModePlanExecuteLabel'))}</option>
                 <option value="supervisor" ${currentMode === 'supervisor' ? 'selected' : ''}>${escapeHtml(_t('chat.agentModeSupervisorLabel'))}</option>

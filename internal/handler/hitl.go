@@ -42,6 +42,18 @@ type pendingInterrupt struct {
 	decideCh       chan hitlDecision
 }
 
+type hitlInterruptRecord struct {
+	InterruptID    string
+	ConversationID string
+	MessageID      string
+	Mode           string
+	ToolName       string
+	ToolCallID     string
+	Payload        string
+	Status         string
+	Decision       string
+}
+
 type HITLManager struct {
 	db     *database.DB
 	logger *zap.Logger
@@ -49,6 +61,20 @@ type HITLManager struct {
 	mu      sync.RWMutex
 	runtime map[string]hitlRuntimeConfig
 	pending map[string]*pendingInterrupt
+}
+
+func (m *HITLManager) GetInterrupt(interruptID string) (*hitlInterruptRecord, error) {
+	var rec hitlInterruptRecord
+	err := m.db.QueryRow(`SELECT id, conversation_id, COALESCE(message_id, ''), mode, tool_name, COALESCE(tool_call_id, ''), COALESCE(payload, ''), status, COALESCE(decision, '')
+		FROM hitl_interrupts WHERE id = ?`, interruptID).
+		Scan(&rec.InterruptID, &rec.ConversationID, &rec.MessageID, &rec.Mode, &rec.ToolName, &rec.ToolCallID, &rec.Payload, &rec.Status, &rec.Decision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &rec, nil
 }
 
 func NewHITLManager(db *database.DB, logger *zap.Logger) *HITLManager {
@@ -94,7 +120,7 @@ CREATE TABLE IF NOT EXISTS hitl_conversation_configs (
 	// On startup, cancel all orphaned pending interrupts from previous process.
 	// Their in-memory channels are gone, so they can never be resolved.
 	res, err := m.db.Exec(`UPDATE hitl_interrupts SET status='cancelled', decision='reject',
-		decision_comment='process restarted', decided_at=CURRENT_TIMESTAMP WHERE status='pending'`)
+		decision_comment='process restarted', decided_at=CURRENT_TIMESTAMP WHERE status='pending' AND id NOT LIKE 'approval_%'`)
 	if err != nil {
 		m.logger.Warn("failed to cancel orphaned HITL interrupts", zap.Error(err))
 	} else if n, _ := res.RowsAffected(); n > 0 {
@@ -242,8 +268,16 @@ func (m *HITLManager) NeedsToolApproval(conversationID, toolName string) bool {
 }
 
 func (m *HITLManager) CreatePendingInterrupt(conversationID, assistantMessageID, mode, toolName, toolCallID, payload string) (*pendingInterrupt, error) {
-	now := time.Now()
 	id := "hitl_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+	return m.CreatePendingInterruptWithID(id, conversationID, assistantMessageID, mode, toolName, toolCallID, payload)
+}
+
+func (m *HITLManager) CreatePendingInterruptWithID(id, conversationID, assistantMessageID, mode, toolName, toolCallID, payload string) (*pendingInterrupt, error) {
+	now := time.Now()
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = "hitl_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+	}
 	if _, err := m.db.Exec(`INSERT INTO hitl_interrupts
 		(id, conversation_id, message_id, mode, tool_name, tool_call_id, payload, status, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
@@ -329,7 +363,29 @@ func (m *HITLManager) ResolveInterrupt(interruptID, decision, comment string, ed
 	m.mu.RLock()
 	p, ok := m.pending[interruptID]
 	m.mu.RUnlock()
+	if strings.HasPrefix(interruptID, "approval_") {
+		res, err := m.db.Exec(`UPDATE hitl_interrupts SET status='decided', decision=?, decision_comment=?, decided_at=? WHERE id=? AND status='pending'`,
+			decision, strings.TrimSpace(comment), time.Now(), interruptID)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return errors.New("interrupt not found or already resolved")
+		}
+		m.mu.Lock()
+		delete(m.pending, interruptID)
+		m.mu.Unlock()
+		return nil
+	}
 	if !ok {
+		res, err := m.db.Exec(`UPDATE hitl_interrupts SET status='decided', decision=?, decision_comment=?, decided_at=? WHERE id=? AND status='pending'`,
+			decision, strings.TrimSpace(comment), time.Now(), interruptID)
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			return nil
+		}
 		return errors.New("interrupt not found or already resolved")
 	}
 	d := hitlDecision{
@@ -615,6 +671,12 @@ func (h *AgentHandler) DecideHITLInterrupt(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
+	if strings.HasPrefix(req.InterruptID, "approval_") {
+		if err := h.resumeAgentRuntimeApproval(c.Request.Context(), req.InterruptID, req.Decision, req.Comment); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Agent Runtime 审批恢复失败: " + err.Error()})
+			return
+		}
+	}
 	if h.audit != nil {
 		h.audit.RecordOK(c, "hitl", "decision", "HITL 审批决策", "hitl_interrupt", req.InterruptID, map[string]interface{}{
 			"decision": req.Decision,
@@ -689,7 +751,6 @@ func (h *AgentHandler) interceptHITLForEinoTool(runCtx context.Context, cancelRu
 	}
 	return arguments, nil
 }
-
 
 type hitlConfigReq struct {
 	ConversationID string `json:"conversationId" binding:"required"`

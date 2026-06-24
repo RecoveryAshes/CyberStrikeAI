@@ -1,0 +1,30 @@
+{
+  "should_trigger": [
+    {
+      "prompt": "扫一下 192.168.64.2 的全端口，并告诉我服务和版本",
+      "expectation": "Use masscan first for open TCP ports, then nmap on confirmed ports with service/version/default scripts."
+    },
+    {
+      "prompt": "masscan 和 nmap 应该怎么配合做端口扫描？",
+      "expectation": "Explain masscan for liveness discovery and nmap for service/version/script enumeration."
+    },
+    {
+      "prompt": "对这个 C 段做端口存活确认，别太快，后面再枚举服务",
+      "expectation": "Choose conservative masscan rate, then nmap only on confirmed open ports."
+    }
+  ],
+  "near_miss": [
+    {
+      "prompt": "查一下这个公司的 ICP 备案",
+      "expectation": "Should use icp-query skill, not port-scanning."
+    },
+    {
+      "prompt": "用 quake 搜这个域名暴露了哪些资产",
+      "expectation": "This is cyberspace mapping, not direct port scanning."
+    },
+    {
+      "prompt": "分析这个 HTTP 接口有没有 SQL 注入",
+      "expectation": "Should use injection or API testing skills instead of port-scanning unless port discovery is requested."
+    }
+  ]
+}

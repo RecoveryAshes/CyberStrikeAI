@@ -158,6 +158,9 @@ func effectiveMode(sr *config.OpenAIReasoningConfig, client *ClientIntent, allow
 	if !allowClient || client == nil {
 		return server
 	}
+	if normalizeEffort(client.Effort) != "" {
+		return "on"
+	}
 	cm := strings.ToLower(strings.TrimSpace(client.Mode))
 	if cm == "" || cm == "default" {
 		return server

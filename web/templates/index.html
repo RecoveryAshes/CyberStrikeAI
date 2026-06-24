@@ -1088,6 +1088,14 @@
                                                     </div>
                                                     <div class="role-selection-checkmark-main agent-mode-check" data-agent-mode-check="eino_single">✓</div>
                                                 </button>
+                                                <button type="button" class="role-selection-item-main agent-mode-option" data-value="agent_runtime" role="option" onclick="selectAgentMode('agent_runtime')">
+                                                    <div class="role-selection-item-icon-main" aria-hidden="true">⌘</div>
+                                                    <div class="role-selection-item-content-main">
+                                                        <div class="role-selection-item-name-main" data-i18n="chat.agentModeCodexLabel">Agent Runtime</div>
+                                                        <div class="role-selection-item-description-main" data-i18n="chat.agentModeCodexHint">独立 Rust RunLoop，structured plan / tool follow-up / turn 完成语义</div>
+                                                    </div>
+                                                    <div class="role-selection-checkmark-main agent-mode-check" data-agent-mode-check="agent_runtime">✓</div>
+                                                </button>
                                                 <button type="button" class="role-selection-item-main agent-mode-option" data-value="deep" role="option" onclick="selectAgentMode('deep')">
                                                     <div class="role-selection-item-icon-main" aria-hidden="true">🧩</div>
                                                     <div class="role-selection-item-content-main">
@@ -2706,6 +2714,7 @@
                                             <label for="multi-agent-robot-mode" data-i18n="settingsBasic.multiAgentRobotMode">机器人默认对话模式</label>
                                             <select id="multi-agent-robot-mode" class="form-select">
                                                 <option value="eino_single" data-i18n="chat.agentModeEinoSingle">Eino 单代理（ADK）</option>
+                                                <option value="agent_runtime" data-i18n="chat.agentModeCodexLabel">Agent Runtime</option>
                                                 <option value="deep" data-i18n="chat.agentModeDeep">Deep（DeepAgent）</option>
                                                 <option value="plan_execute" data-i18n="chat.agentModePlanExecuteLabel">Plan-Execute</option>
                                                 <option value="supervisor" data-i18n="chat.agentModeSupervisorLabel">Supervisor</option>
@@ -4006,11 +4015,12 @@
                     <label for="batch-queue-agent-mode" data-i18n="batchImportModal.agentMode">代理模式</label>
                     <select id="batch-queue-agent-mode" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; font-size: 0.875rem;">
                         <option value="eino_single" data-i18n="chat.agentModeEinoSingle">Eino 单代理（ADK）</option>
+                        <option value="agent_runtime" data-i18n="chat.agentModeCodexLabel">Agent Runtime</option>
                         <option value="deep" data-i18n="chat.agentModeDeep">Deep（DeepAgent）</option>
                         <option value="plan_execute" data-i18n="chat.agentModePlanExecuteLabel">Plan-Execute</option>
                         <option value="supervisor" data-i18n="chat.agentModeSupervisorLabel">Supervisor</option>
                     </select>
-                    <div class="form-hint" style="margin-top: 4px;" data-i18n="batchImportModal.agentModeHint">与对话页一致：Eino 单代理（ADK），或 Deep / Plan-Execute / Supervisor（后三种需已启用多代理）。</div>
+                    <div class="form-hint" style="margin-top: 4px;" data-i18n="batchImportModal.agentModeHint">与对话页一致：Eino 单代理（ADK）、Agent Runtime，或 Deep / Plan-Execute / Supervisor（后三种需已启用多代理）。</div>
                 </div>
                 <div class="form-group">
                     <label for="batch-queue-schedule-mode" data-i18n="batchImportModal.scheduleMode">调度方式</label>
@@ -4504,4 +4514,3 @@
     <script src="/static/js/c2.js"></script>
 </body>
 </html>
-

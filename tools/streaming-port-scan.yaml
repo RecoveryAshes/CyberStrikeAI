@@ -1,0 +1,161 @@
+name: "streaming_port_scan"
+command: "python3"
+args:
+  - "tools/scripts/streaming_port_scan_wrapper.py"
+enabled: true
+short_description: "自适应端口扫描：少量端口connect确认，大量端口masscan确认，再交给nmap"
+description: |
+  自适应流式端口扫描编排工具。少量显式端口默认用 TCP connect 确认开放，范围/大量端口默认用 masscan 确认开放；随后只把已确认开放的 ip:port 按批次交给 nmap 执行服务、版本和默认 NSE 脚本枚举。
+
+  **默认流程：**
+  - connect：少量显式端口的轻量 TCP 存活确认
+  - masscan：大量端口/范围/CIDR 的快速开放端口确认
+  - nmap：只对 connect/masscan 确认开放的端口执行 `-sT -sV -sC`
+  - 输出：默认只把会话级追加 CSV `streaming_port_scan.summary.csv` 放到 CyberStrikeAI 文件管理；调试日志/JSON 放到 `CYBERSTRIKE_TOOL_TMP_DIR/streaming_port_scan/` 或 `/tmp/cyberstrike-ai-tools/streaming_port_scan/`
+
+  **适用场景：**
+  - 少量端口不想动用 masscan，只想先轻量确认再 nmap
+  - 大范围扫描时不想等 masscan 全部结束才开始 nmap
+  - 大范围或全端口扫描中希望尽早看到服务识别结果
+  - 需要把扫描结果保存到 CyberStrikeAI 文件管理，默认只保留方便查看的 CSV
+
+  **注意事项：**
+  - 只用于已授权目标。
+  - rate 是 masscan 每秒发包数，不是带宽 Mbps。
+  - VM/NAT/UTM 环境建议从 500~1000 开始。
+  - nmap 不负责未知端口发现；它只识别 connect/masscan 已经确认 open 的端口。
+  - nmap 会按批次运行，同一主机后续发现新端口时可能再次被 nmap 扫描。
+parameters:
+  - name: "target"
+    type: "string"
+    description: "目标 IP、主机名、范围或 CIDR。"
+    required: true
+    flag: "--target"
+    format: "flag"
+  - name: "ports"
+    type: "string"
+    description: "masscan 端口范围或列表，例如 `1-65535`、`80,443,8080`。"
+    required: false
+    default: "1-65535"
+    flag: "--ports"
+    format: "flag"
+  - name: "rate"
+    type: "int"
+    description: "masscan 每秒发包数。VM/NAT 环境建议 500~1000。"
+    required: false
+    default: 800
+    flag: "--rate"
+    format: "flag"
+  - name: "discovery_mode"
+    type: "string"
+    description: "端口确认方式：auto=少量显式端口用 connect，其他用 masscan；connect=强制 TCP connect；masscan=强制 masscan。"
+    required: false
+    default: "auto"
+    flag: "--discovery-mode"
+    format: "flag"
+    options: ["auto", "connect", "masscan"]
+  - name: "small_port_threshold"
+    type: "int"
+    description: "auto 模式下，显式端口数量小于等于该值且目标不是 CIDR/多目标时，使用 TCP connect。"
+    required: false
+    default: 20
+    flag: "--small-port-threshold"
+    format: "flag"
+  - name: "connect_timeout_seconds"
+    type: "string"
+    description: "TCP connect 单端口超时时间，单位秒。"
+    required: false
+    default: "1.5"
+    flag: "--connect-timeout-seconds"
+    format: "flag"
+  - name: "connect_workers"
+    type: "int"
+    description: "TCP connect 并发 worker 数。"
+    required: false
+    default: 64
+    flag: "--connect-workers"
+    format: "flag"
+  - name: "interface"
+    type: "string"
+    description: "可选 masscan 网卡参数，对应 `-e`。不确定时不要传。"
+    required: false
+    flag: "--interface"
+    format: "flag"
+    omit_if_empty: true
+  - name: "batch_size"
+    type: "int"
+    description: "累计发现多少个新 ip:port 后触发一批 nmap。"
+    required: false
+    default: 10
+    flag: "--batch-size"
+    format: "flag"
+  - name: "flush_interval_seconds"
+    type: "int"
+    description: "即使未达到 batch_size，也每隔多少秒把待识别端口交给 nmap。"
+    required: false
+    default: 8
+    flag: "--flush-interval-seconds"
+    format: "flag"
+  - name: "nmap_workers"
+    type: "int"
+    description: "并发 nmap worker 数。默认 1，避免过载；大范围授权扫描可调到 2~4。"
+    required: false
+    default: 1
+    flag: "--nmap-workers"
+    format: "flag"
+  - name: "nmap_timeout_seconds"
+    type: "string"
+    description: "单个 nmap 批次的最大运行秒数，避免 NSE/过滤端口长期挂住。默认 180。"
+    required: false
+    default: "180"
+    flag: "--nmap-timeout-seconds"
+    format: "flag"
+  - name: "nmap_timing"
+    type: "string"
+    description: "nmap 时序值，例如 3 或 4。默认 4。"
+    required: false
+    default: "4"
+    flag: "--nmap-timing"
+    format: "flag"
+  - name: "nmap_additional_args"
+    type: "string"
+    description: "额外 nmap 参数，默认 `-Pn`，按空格解析。"
+    required: false
+    default: "-Pn"
+    flag: "--nmap-additional-args"
+    format: "flag"
+  - name: "masscan_additional_args"
+    type: "string"
+    description: "额外 masscan 参数，按空格解析。"
+    required: false
+    flag: "--masscan-additional-args"
+    format: "flag"
+    omit_if_empty: true
+  - name: "conversation_id"
+    type: "string"
+    description: "会话 ID，用于把结果归档到文件管理对应目录；不确定时可留空，默认 _manual。"
+    required: false
+    flag: "--conversation-id"
+    format: "flag"
+    omit_if_empty: true
+  - name: "relative_dir"
+    type: "string"
+    description: "可选输出子目录名。"
+    required: false
+    flag: "--relative-dir"
+    format: "flag"
+    omit_if_empty: true
+  - name: "output_name_prefix"
+    type: "string"
+    description: "扫描批次名前缀，用于 CSV 的 scan_id 和 /tmp 调试目录；不会改变会话级 CSV 文件名。"
+    required: false
+    default: "streaming_port_scan"
+    flag: "--output-name-prefix"
+    format: "flag"
+  - name: "save_debug_files"
+    type: "bool"
+    description: "是否把 events/connect/masscan/nmap/findings 调试文件也保存到文件管理。默认 false：文件管理只保存 summary.csv，调试文件放在 CYBERSTRIKE_TOOL_TMP_DIR/streaming_port_scan/ 或 /tmp/cyberstrike-ai-tools/streaming_port_scan/。"
+    required: false
+    default: false
+    flag: "--save-debug-files"
+    format: "flag"

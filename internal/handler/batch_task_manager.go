@@ -58,7 +58,7 @@ type BatchTaskQueue struct {
 	ID                    string       `json:"id"`
 	Title                 string       `json:"title,omitempty"`
 	Role                  string       `json:"role,omitempty"` // 角色名称（空字符串表示默认角色）
-	AgentMode             string       `json:"agentMode"`      // single | eino_single | deep | plan_execute | supervisor
+	AgentMode             string       `json:"agentMode"`      // single | eino_single | agent_runtime | deep | plan_execute | supervisor
 	ScheduleMode          string       `json:"scheduleMode"`   // manual | cron
 	CronExpr              string       `json:"cronExpr,omitempty"`
 	NextRunAt             *time.Time   `json:"nextRunAt,omitempty"`
@@ -131,7 +131,7 @@ func (m *BatchTaskManager) CreateBatchQueue(
 		Title:           title,
 		Role:            role,
 		ProjectID:       strings.TrimSpace(projectID),
-		AgentMode:       config.NormalizeAgentMode(agentMode),
+		AgentMode:       config.NormalizeBatchAgentMode(agentMode),
 		ScheduleMode:    normalizeBatchQueueScheduleMode(scheduleMode),
 		CronExpr:        strings.TrimSpace(cronExpr),
 		NextRunAt:       nextRunAt,
@@ -243,7 +243,7 @@ func (m *BatchTaskManager) loadQueueFromDB(queueID string) *BatchTaskQueue {
 		queue.Role = queueRow.Role.String
 	}
 	if queueRow.AgentMode.Valid {
-		queue.AgentMode = config.NormalizeAgentMode(queueRow.AgentMode.String)
+		queue.AgentMode = config.NormalizeBatchAgentMode(queueRow.AgentMode.String)
 	}
 	if queueRow.ScheduleMode.Valid {
 		queue.ScheduleMode = normalizeBatchQueueScheduleMode(queueRow.ScheduleMode.String)
@@ -482,7 +482,7 @@ func (m *BatchTaskManager) LoadFromDB() error {
 			queue.Role = queueRow.Role.String
 		}
 		if queueRow.AgentMode.Valid {
-			queue.AgentMode = config.NormalizeAgentMode(queueRow.AgentMode.String)
+			queue.AgentMode = config.NormalizeBatchAgentMode(queueRow.AgentMode.String)
 		}
 		if queueRow.ScheduleMode.Valid {
 			queue.ScheduleMode = normalizeBatchQueueScheduleMode(queueRow.ScheduleMode.String)
@@ -672,7 +672,7 @@ func (m *BatchTaskManager) UpdateQueueMetadata(queueID, title, role, agentMode s
 
 	// 如果未传 agentMode，保留原值
 	if strings.TrimSpace(agentMode) != "" {
-		agentMode = config.NormalizeAgentMode(agentMode)
+		agentMode = config.NormalizeBatchAgentMode(agentMode)
 	} else {
 		agentMode = queue.AgentMode
 	}

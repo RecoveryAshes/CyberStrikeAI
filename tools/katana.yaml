@@ -39,7 +39,7 @@ parameters:
     default: true
   - name: "form_extraction"
     type: "bool"
-    description: "启用表单提取（-fx / -form-extraction）"
+    description: "启用表单提取，对应当前 Katana 版本的 -fx/--form-extraction"
     required: false
     flag: "-fx"
     format: "flag"
@@ -50,10 +50,10 @@ parameters:
       额外的Katana参数。用于传递未在参数列表中定义的Katana选项。
 
       **示例值：**
-      - "-headless": 使用无头浏览器
-      - "-output-template '{{url}}'": 自定义输出格式
-      - "-output output.txt": 输出到文件
-      - "-c 20": 并发数
+      - "-hl": 使用无头浏览器
+      - "-j": JSONL 输出
+      - "-o output.txt": 输出到文件
+      - "-c": 并发数
 
       **注意事项：**
       - 多个参数用空格分隔
