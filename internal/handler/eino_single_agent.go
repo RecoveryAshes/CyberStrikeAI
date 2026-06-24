@@ -59,8 +59,16 @@ func (h *AgentHandler) EinoSingleAgentLoopStream(c *gin.Context) {
 		sseLine = append(sseLine, []byte("data: ")...)
 		sseLine = append(sseLine, b...)
 		sseLine = append(sseLine, '\n', '\n')
-		if ssePublishConversationID != "" && h.taskEventBus != nil {
-			h.taskEventBus.Publish(ssePublishConversationID, sseLine)
+		if h.taskEventBus != nil {
+			publishID := ssePublishConversationID
+			if m, ok := data.(map[string]interface{}); ok {
+				if v, ok := m["conversationId"].(string); ok && strings.TrimSpace(v) != "" {
+					publishID = strings.TrimSpace(v)
+				}
+			}
+			if publishID != "" {
+				h.taskEventBus.Publish(publishID, sseLine)
+			}
 		}
 		if clientDisconnected {
 			return
@@ -90,7 +98,7 @@ func (h *AgentHandler) EinoSingleAgentLoopStream(c *gin.Context) {
 		zap.String("conversationId", req.ConversationID),
 	)
 
-	prep, err := h.prepareMultiAgentSession(&req, c, "eino_agent_stream")
+	prep, err := h.prepareMultiAgentSessionWithTitlePublisher(&req, c, "eino_agent_stream", sendEvent)
 	if err != nil {
 		sendEvent("error", err.Error(), nil)
 		sendEvent("done", "", nil)
@@ -395,7 +403,6 @@ func (h *AgentHandler) EinoSingleAgentLoopStream(c *gin.Context) {
 			h.logger.Warn("保存代理轨迹失败", zap.Error(err))
 		}
 	}
-
 	sendEvent("response", result.Response, map[string]interface{}{
 		"mcpExecutionIds": cumulativeMCPExecutionIDs,
 		"conversationId":  conversationID,
@@ -502,7 +509,6 @@ func (h *AgentHandler) EinoSingleAgentLoop(c *gin.Context) {
 	if result.LastAgentTraceInput != "" || result.LastAgentTraceOutput != "" {
 		_ = h.db.SaveAgentTrace(prep.ConversationID, result.LastAgentTraceInput, result.LastAgentTraceOutput)
 	}
-
 	c.JSON(http.StatusOK, gin.H{
 		"response":           result.Response,
 		"conversationId":     prep.ConversationID,

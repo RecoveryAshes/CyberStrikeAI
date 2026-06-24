@@ -5,7 +5,9 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -280,6 +282,11 @@ func New(cfg *config.Config, log *logger.Logger, configPath string) (*App, error
 				log.Logger.Warn("重建知识库索引失败", zap.Error(err))
 			}
 		}()
+	} else if fallbackDB, err := openKnowledgeFallbackDB(cfg, configPath, log.Logger); err == nil && fallbackDB != nil {
+		knowledgeDBConn = fallbackDB
+		knowledge.RegisterKnowledgeFallbackTool(mcpServer, fallbackDB.DB, log.Logger)
+	} else if err != nil {
+		log.Logger.Debug("跳过知识库降级 MCP 工具注册", zap.Error(err))
 	}
 
 	// 配置文件路径必须由入口传入（与 flag -config 一致）。勿再用 os.Args[1]，否则 ./cyberstrike-ai --https 会把 --https 当成路径。
@@ -316,13 +323,18 @@ func New(cfg *config.Config, log *logger.Logger, configPath string) (*App, error
 	log.Logger.Info("多代理 Markdown 子 Agent 目录", zap.String("agentsDir", agentsDir))
 
 	// 创建处理器
-	agentHandler := handler.NewAgentHandler(agent, db, cfg, log.Logger)
+	agentHandler := handler.NewAgentHandler(agent, db, cfg, log.Logger, configPath)
 	agentHandler.SetAudit(auditSvc)
 	agentHandler.SetAgentsMarkdownDir(agentsDir)
 	// 如果知识库已启用，设置知识库管理器到AgentHandler以便记录检索日志
 	if knowledgeManager != nil {
 		agentHandler.SetKnowledgeManager(knowledgeManager)
 	}
+	if knowledgeRetriever != nil {
+		agentHandler.SetKnowledgeRetriever(knowledgeRetriever)
+	}
+	agentHandler.SetMCPServer(mcpServer)
+	agentHandler.SetExternalMCPManager(externalMCPMgr)
 	monitorHandler := handler.NewMonitorHandler(mcpServer, executor, db, log.Logger)
 	monitorHandler.SetAudit(auditSvc)
 	monitorHandler.SetExternalMCPManager(externalMCPMgr) // 设置外部MCP管理器，以便获取外部MCP执行记录
@@ -524,7 +536,133 @@ func (a *App) mcpHandlerWithAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if a.tryHandleExternalMCPHTTP(w, r) {
+		return
+	}
 	a.mcpServer.HandleHTTP(w, r)
+}
+
+func (a *App) tryHandleExternalMCPHTTP(w http.ResponseWriter, r *http.Request) bool {
+	if a == nil || a.externalMCPMgr == nil || r.Method != http.MethodPost || r.URL.Query().Get("sessionid") != "" {
+		return false
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeMCPJSONRPCError(w, nil, -32700, "Parse error")
+		return true
+	}
+	r.Body = io.NopCloser(strings.NewReader(string(body)))
+	var msg mcp.Message
+	if err := json.Unmarshal(body, &msg); err != nil {
+		writeMCPJSONRPCError(w, nil, -32700, "Parse error")
+		return true
+	}
+	if msg.Method != "tools/call" {
+		return false
+	}
+	var req mcp.CallToolRequest
+	if err := json.Unmarshal(msg.Params, &req); err != nil {
+		writeMCPJSONRPCError(w, msg.ID.Value(), -32602, "Invalid params")
+		return true
+	}
+	if !strings.Contains(req.Name, "::") {
+		return false
+	}
+	if strings.HasPrefix(req.Name, "builtin::") {
+		req.Name = strings.TrimPrefix(req.Name, "builtin::")
+		if req.Name == "" {
+			writeMCPJSONRPCError(w, msg.ID.Value(), -32602, "Invalid params")
+			return true
+		}
+		msg.Params, _ = json.Marshal(mcp.CallToolRequest{
+			Name:      req.Name,
+			Arguments: req.Arguments,
+		})
+		r.Body = io.NopCloser(strings.NewReader(mustJSONRPCMessageString(msg)))
+		return false
+	}
+	ctx := r.Context()
+	if a.config.Agent.ToolTimeoutMinutes > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(r.Context(), time.Duration(a.config.Agent.ToolTimeoutMinutes)*time.Minute)
+		defer cancel()
+	}
+	result, _, err := a.externalMCPMgr.CallTool(ctx, req.Name, req.Arguments)
+	if err != nil {
+		writeMCPJSONRPCResult(w, msg.ID.Value(), mcp.CallToolResponse{
+			Content: []mcp.Content{{Type: "text", Text: "工具执行失败: " + err.Error()}},
+			IsError: true,
+		})
+		return true
+	}
+	if result == nil {
+		result = &mcp.ToolResult{Content: []mcp.Content{{Type: "text", Text: "工具执行完成，但未返回结果"}}}
+	}
+	writeMCPJSONRPCResult(w, msg.ID.Value(), mcp.CallToolResponse{
+		Content: result.Content,
+		IsError: result.IsError,
+	})
+	return true
+}
+
+func mustJSONRPCMessageString(msg mcp.Message) string {
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+func writeMCPJSONRPCResult(w http.ResponseWriter, id interface{}, result interface{}) {
+	resultJSON, _ := json.Marshal(result)
+	resp := mcp.Message{
+		Version: "2.0",
+		ID:      mcp.NewMessageID(id),
+		Result:  resultJSON,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func writeMCPJSONRPCError(w http.ResponseWriter, id interface{}, code int, message string) {
+	resp := mcp.Message{
+		Version: "2.0",
+		ID:      mcp.NewMessageID(id),
+		Error:   &mcp.Error{Code: code, Message: message},
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func openKnowledgeFallbackDB(cfg *config.Config, configPath string, logger *zap.Logger) (*database.DB, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	dbPath := strings.TrimSpace(cfg.Database.KnowledgeDBPath)
+	if dbPath == "" {
+		dbPath = strings.TrimSpace(cfg.Database.Path)
+	}
+	if dbPath == "" {
+		return nil, nil
+	}
+	if !filepath.IsAbs(dbPath) {
+		base := strings.TrimSpace(filepath.Dir(configPath))
+		if base == "" || base == "." {
+			base = "."
+		}
+		dbPath = filepath.Join(base, dbPath)
+	}
+	if _, err := os.Stat(dbPath); err != nil {
+		return nil, err
+	}
+	dbConn, err := database.NewKnowledgeDB(dbPath, logger)
+	if err != nil {
+		return nil, err
+	}
+	if logger != nil {
+		logger.Info("使用知识库降级 SQLite 检索", zap.String("path", dbPath))
+	}
+	return dbConn, nil
 }
 
 // Run 启动应用（向后兼容，不支持优雅关闭）
@@ -758,9 +896,9 @@ func setupRoutes(
 	authRoutes := api.Group("/auth")
 	{
 		authRoutes.POST("/login", authHandler.Login)
-		authRoutes.POST("/logout", security.AuthMiddleware(authManager), authHandler.Logout)
-		authRoutes.POST("/change-password", security.AuthMiddleware(authManager), authHandler.ChangePassword)
-		authRoutes.GET("/validate", security.AuthMiddleware(authManager), authHandler.Validate)
+		authRoutes.POST("/logout", authMiddleware(appConfig(app), authManager), authHandler.Logout)
+		authRoutes.POST("/change-password", authMiddleware(appConfig(app), authManager), authHandler.ChangePassword)
+		authRoutes.GET("/validate", authMiddleware(appConfig(app), authManager), authHandler.Validate)
 	}
 
 	// 机器人回调（无需登录，供企业微信/钉钉/飞书服务器调用）
@@ -776,7 +914,7 @@ func setupRoutes(
 	}
 
 	protected := api.Group("")
-	protected.Use(security.AuthMiddleware(authManager))
+	protected.Use(authMiddleware(appConfig(app), authManager))
 	{
 		// 机器人测试（需登录）：POST /api/robot/test，body: {"platform":"dingtalk","user_id":"test","text":"帮助"}，用于验证机器人逻辑
 		protected.POST("/robot/test", robotHandler.HandleRobotTest)
@@ -790,6 +928,9 @@ func setupRoutes(
 		// Eino ADK 单代理（ChatModelAgent + Runner；不依赖 multi_agent.enabled）
 		protected.POST("/eino-agent", agentHandler.EinoSingleAgentLoop)
 		protected.POST("/eino-agent/stream", agentHandler.EinoSingleAgentLoopStream)
+		protected.POST("/agent-runtime/stream", agentHandler.AgentRuntimeLoopStream)
+		// Deprecated compatibility route for older frontends.
+		protected.POST("/codex-agent/stream", agentHandler.AgentRuntimeLoopStream)
 		protected.GET("/hitl/pending", agentHandler.ListHITLPending)
 		protected.POST("/hitl/decision", agentHandler.DecideHITLInterrupt)
 		protected.POST("/hitl/dismiss", agentHandler.DismissHITLInterrupt)
@@ -1200,6 +1341,22 @@ func setupRoutes(
 		}
 		c.HTML(http.StatusOK, "index.html", gin.H{"Version": version})
 	})
+}
+
+func authMiddleware(cfg *config.Config, authManager *security.AuthManager) gin.HandlerFunc {
+	if cfg != nil && cfg.Auth.DisabledEffective() {
+		return func(c *gin.Context) {
+			c.Next()
+		}
+	}
+	return security.AuthMiddleware(authManager)
+}
+
+func appConfig(app *App) *config.Config {
+	if app == nil {
+		return nil
+	}
+	return app.config
 }
 
 // registerWebshellTools 注册 WebShell 相关 MCP 工具，供 AI 助手在指定连接上执行命令与文件操作
@@ -1793,6 +1950,7 @@ func initializeKnowledge(
 
 	// 设置知识库管理器到AgentHandler以便记录检索日志
 	agentHandler.SetKnowledgeManager(knowledgeManager)
+	agentHandler.SetKnowledgeRetriever(knowledgeRetriever)
 
 	// 更新 App 中的知识库组件（如果 App 不为 nil，说明是动态初始化）
 	if app != nil {

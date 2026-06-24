@@ -1,0 +1,17 @@
+.deploy-build/
+
+# Local runtime state and dependencies
+data/
+tmp/
+chat_uploads/
+.cyberstrike-agent-runtime/
+.opencode/node_modules/
+apps/chat-web/node_modules/
+apps/chat-web/dist/
+apps/chat-web/.test-dist/
+agent-runtime/target/
+
+# Machine-local config and binaries
+config.yaml
+cyberstrike-ai
+cyberstrike-ai.linux-arm64

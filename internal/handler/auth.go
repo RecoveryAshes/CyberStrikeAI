@@ -48,6 +48,17 @@ type changePasswordRequest struct {
 
 // Login verifies password and returns a session token.
 func (h *AuthHandler) Login(c *gin.Context) {
+	if h.authDisabled() {
+		expiresAt := time.Now().Add(24 * time.Hour)
+		c.JSON(http.StatusOK, gin.H{
+			"token":               "auth-disabled",
+			"expires_at":          expiresAt.UTC().Format(time.RFC3339),
+			"session_duration_hr": 24,
+			"auth_disabled":       true,
+		})
+		return
+	}
+
 	var req loginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "密码不能为空"})
@@ -115,6 +126,11 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 
 // ChangePassword updates the login password.
 func (h *AuthHandler) ChangePassword(c *gin.Context) {
+	if h.authDisabled() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "当前已临时关闭登录认证"})
+		return
+	}
+
 	var req changePasswordRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "参数无效"})
@@ -192,6 +208,16 @@ func (h *AuthHandler) ChangePassword(c *gin.Context) {
 
 // Validate returns the current session status.
 func (h *AuthHandler) Validate(c *gin.Context) {
+	if h.authDisabled() {
+		expiresAt := time.Now().Add(24 * time.Hour)
+		c.JSON(http.StatusOK, gin.H{
+			"token":         "auth-disabled",
+			"expires_at":    expiresAt.UTC().Format(time.RFC3339),
+			"auth_disabled": true,
+		})
+		return
+	}
+
 	token := c.GetString(security.ContextAuthTokenKey)
 	if token == "" {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "会话无效"})
@@ -208,4 +234,8 @@ func (h *AuthHandler) Validate(c *gin.Context) {
 		"token":      session.Token,
 		"expires_at": session.ExpiresAt.UTC().Format(time.RFC3339),
 	})
+}
+
+func (h *AuthHandler) authDisabled() bool {
+	return h != nil && h.config != nil && h.config.Auth.DisabledEffective()
 }

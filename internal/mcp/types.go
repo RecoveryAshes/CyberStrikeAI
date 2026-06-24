@@ -34,6 +34,10 @@ type MessageID struct {
 	value interface{}
 }
 
+func NewMessageID(value interface{}) MessageID {
+	return MessageID{value: value}
+}
+
 // UnmarshalJSON 自定义反序列化，支持字符串、数字和null
 func (m *MessageID) UnmarshalJSON(data []byte) error {
 	// 尝试解析为null

@@ -76,8 +76,16 @@ func (h *AgentHandler) MultiAgentLoopStream(c *gin.Context) {
 		sseLine = append(sseLine, []byte("data: ")...)
 		sseLine = append(sseLine, b...)
 		sseLine = append(sseLine, '\n', '\n')
-		if ssePublishConversationID != "" && h.taskEventBus != nil {
-			h.taskEventBus.Publish(ssePublishConversationID, sseLine)
+		if h.taskEventBus != nil {
+			publishID := ssePublishConversationID
+			if m, ok := data.(map[string]interface{}); ok {
+				if v, ok := m["conversationId"].(string); ok && strings.TrimSpace(v) != "" {
+					publishID = strings.TrimSpace(v)
+				}
+			}
+			if publishID != "" {
+				h.taskEventBus.Publish(publishID, sseLine)
+			}
 		}
 		if clientDisconnected {
 			return
@@ -107,7 +115,7 @@ func (h *AgentHandler) MultiAgentLoopStream(c *gin.Context) {
 		zap.String("conversationId", req.ConversationID),
 	)
 
-	prep, err := h.prepareMultiAgentSession(&req, c, "multi_agent_stream")
+	prep, err := h.prepareMultiAgentSessionWithTitlePublisher(&req, c, "multi_agent_stream", sendEvent)
 	if err != nil {
 		sendEvent("error", err.Error(), nil)
 		sendEvent("done", "", nil)
@@ -407,7 +415,6 @@ func (h *AgentHandler) MultiAgentLoopStream(c *gin.Context) {
 			h.logger.Warn("保存代理轨迹失败", zap.Error(err))
 		}
 	}
-
 	effectiveOrch := config.NormalizeMultiAgentOrchestration(h.config.MultiAgent.Orchestration)
 	if o := strings.TrimSpace(req.Orchestration); o != "" {
 		effectiveOrch = config.NormalizeMultiAgentOrchestration(o)
@@ -524,7 +531,6 @@ func (h *AgentHandler) MultiAgentLoop(c *gin.Context) {
 			h.logger.Warn("保存代理轨迹失败", zap.Error(err))
 		}
 	}
-
 	c.JSON(http.StatusOK, ChatResponse{
 		Response:        result.Response,
 		MCPExecutionIDs: result.MCPExecutionIDs,

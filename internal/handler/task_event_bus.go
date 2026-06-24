@@ -1,12 +1,17 @@
 package handler
 
-import "sync"
+import (
+	"bytes"
+	"encoding/json"
+	"sync"
+)
 
 // TaskEventBus 将主 SSE 连接上的事件镜像给后订阅的客户端（例如刷新页面后、HITL 审批通过需继续收事件）。
 // 每个 payload 为完整 SSE 行： "data: {...}\n\n"
 type TaskEventBus struct {
-	mu   sync.RWMutex
-	subs map[string]map[*taskEventSub]struct{}
+	mu         sync.RWMutex
+	subs       map[string]map[*taskEventSub]struct{}
+	globalSubs map[*taskEventSub]struct{}
 }
 
 type taskEventSub struct {
@@ -47,7 +52,8 @@ func (s *taskEventSub) closeOnce() {
 
 func NewTaskEventBus() *TaskEventBus {
 	return &TaskEventBus{
-		subs: make(map[string]map[*taskEventSub]struct{}),
+		subs:       make(map[string]map[*taskEventSub]struct{}),
+		globalSubs: make(map[*taskEventSub]struct{}),
 	}
 }
 
@@ -60,6 +66,17 @@ func (b *TaskEventBus) Subscribe(conversationID string) (sub *taskEventSub, ch <
 		b.subs[conversationID] = make(map[*taskEventSub]struct{})
 	}
 	b.subs[conversationID][sub] = struct{}{}
+	b.mu.Unlock()
+	return sub, chBuf
+}
+
+// SubscribeAll 注册全局订阅。全局订阅不会因为某个会话结束而关闭，适合前端用一个
+// EventSource 跟踪多个后台运行中的会话。
+func (b *TaskEventBus) SubscribeAll() (sub *taskEventSub, ch <-chan []byte) {
+	chBuf := make(chan []byte, 8192)
+	sub = &taskEventSub{ch: chBuf}
+	b.mu.Lock()
+	b.globalSubs[sub] = struct{}{}
 	b.mu.Unlock()
 	return sub, chBuf
 }
@@ -82,6 +99,16 @@ func (b *TaskEventBus) Unsubscribe(conversationID string, sub *taskEventSub) {
 	sub.closeOnce()
 }
 
+func (b *TaskEventBus) UnsubscribeAll(sub *taskEventSub) {
+	if sub == nil {
+		return
+	}
+	b.mu.Lock()
+	delete(b.globalSubs, sub)
+	b.mu.Unlock()
+	sub.closeOnce()
+}
+
 // Publish 非阻塞投递；慢消费者丢帧（HITL 场景以最新状态为准，丢帧可接受）。
 func (b *TaskEventBus) Publish(conversationID string, line []byte) {
 	if b == nil || conversationID == "" || len(line) == 0 {
@@ -89,13 +116,16 @@ func (b *TaskEventBus) Publish(conversationID string, line []byte) {
 	}
 	b.mu.RLock()
 	m := b.subs[conversationID]
-	subs := make([]*taskEventSub, 0, len(m))
+	subs := make([]*taskEventSub, 0, len(m)+len(b.globalSubs))
 	for s := range m {
+		subs = append(subs, s)
+	}
+	for s := range b.globalSubs {
 		subs = append(subs, s)
 	}
 	b.mu.RUnlock()
 
-	cp := append([]byte(nil), line...)
+	cp := append([]byte(nil), ensureTaskEventConversationID(conversationID, line)...)
 	for _, s := range subs {
 		s.sendNonBlocking(cp)
 	}
@@ -113,4 +143,40 @@ func (b *TaskEventBus) CloseConversation(conversationID string) {
 	for sub := range m {
 		sub.closeOnce()
 	}
+}
+
+func ensureTaskEventConversationID(conversationID string, line []byte) []byte {
+	conversationID = string(bytes.TrimSpace([]byte(conversationID)))
+	if conversationID == "" || len(line) == 0 {
+		return line
+	}
+	trimmed := bytes.TrimSpace(line)
+	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+		return line
+	}
+	payload := bytes.TrimSpace(bytes.TrimPrefix(trimmed, []byte("data:")))
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) {
+		return line
+	}
+	var envelope map[string]interface{}
+	if err := json.Unmarshal(payload, &envelope); err != nil {
+		return line
+	}
+	data, ok := envelope["data"].(map[string]interface{})
+	if !ok || data == nil {
+		data = map[string]interface{}{}
+		envelope["data"] = data
+	}
+	if _, exists := data["conversationId"]; !exists {
+		data["conversationId"] = conversationID
+	}
+	next, err := json.Marshal(envelope)
+	if err != nil {
+		return line
+	}
+	out := make([]byte, 0, len(next)+8)
+	out = append(out, []byte("data: ")...)
+	out = append(out, next...)
+	out = append(out, '\n', '\n')
+	return out
 }

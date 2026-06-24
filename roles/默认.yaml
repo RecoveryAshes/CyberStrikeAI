@@ -2,4 +2,12 @@ name: 默认
 description: 默认角色，不额外携带用户提示词，使用默认MCP
 user_prompt: ""
 icon: "\U0001F535"
+tools:
+  - record_vulnerability
+  - list_knowledge_risk_types
+  - search_knowledge_base
+  - webshell_file_list
+  - webshell_file_read
+  - batch_task_create
+  - batch_task_get
 enabled: true

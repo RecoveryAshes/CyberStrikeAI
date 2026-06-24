@@ -3,7 +3,9 @@ package handler
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -236,17 +238,19 @@ func (h *ConfigHandler) ApplyWechatRobotBinding(wc config.RobotWechatConfig) err
 
 // GetConfigResponse 获取配置响应
 type GetConfigResponse struct {
-	OpenAI     config.OpenAIConfig     `json:"openai"`
-	Vision     config.VisionConfig     `json:"vision"`
-	FOFA       config.FofaConfig       `json:"fofa"`
-	MCP        config.MCPConfig        `json:"mcp"`
-	Tools      []ToolConfigInfo        `json:"tools"`
-	Agent      config.AgentConfig      `json:"agent"`
-	Hitl       config.HitlConfig       `json:"hitl,omitempty"`
-	Knowledge  config.KnowledgeConfig  `json:"knowledge"`
-	Robots     config.RobotsConfig     `json:"robots,omitempty"`
-	MultiAgent config.MultiAgentPublic `json:"multi_agent,omitempty"`
-	C2         config.C2Public          `json:"c2"`
+	OpenAI       config.OpenAIConfig       `json:"openai"`
+	Vision       config.VisionConfig       `json:"vision"`
+	FOFA         config.FofaConfig         `json:"fofa"`
+	MCP          config.MCPConfig          `json:"mcp"`
+	Tools        []ToolConfigInfo          `json:"tools"`
+	Agent        config.AgentConfig        `json:"agent"`
+	Hitl         config.HitlConfig         `json:"hitl,omitempty"`
+	Knowledge    config.KnowledgeConfig    `json:"knowledge"`
+	AgentRuntime config.AgentRuntimeConfig `json:"agent_runtime,omitempty"`
+	CodexRuntime config.AgentRuntimeConfig `json:"codex_runtime,omitempty"`
+	Robots       config.RobotsConfig       `json:"robots,omitempty"`
+	MultiAgent   config.MultiAgentPublic   `json:"multi_agent,omitempty"`
+	C2           config.C2Public           `json:"c2"`
 }
 
 // ToolConfigInfo 工具配置信息
@@ -320,7 +324,7 @@ func (h *ConfigHandler) GetConfig(c *gin.Context) {
 	}
 	multiPub := config.MultiAgentPublic{
 		Enabled:                      h.config.MultiAgent.Enabled,
-		RobotDefaultAgentMode: config.NormalizeRobotAgentMode(h.config.MultiAgent),
+		RobotDefaultAgentMode:        config.NormalizeRobotAgentMode(h.config.MultiAgent),
 		BatchUseMultiAgent:           h.config.MultiAgent.BatchUseMultiAgent,
 		SubAgentCount:                subAgentCount,
 		Orchestration:                config.NormalizeMultiAgentOrchestration(h.config.MultiAgent.Orchestration),
@@ -333,17 +337,19 @@ func (h *ConfigHandler) GetConfig(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, GetConfigResponse{
-		OpenAI:     h.config.OpenAI,
-		Vision:     h.config.Vision,
-		FOFA:       h.config.FOFA,
-		MCP:        h.config.MCP,
-		Tools:      tools,
-		Agent:      h.config.Agent,
-		Hitl:       h.config.Hitl,
-		Knowledge:  h.config.Knowledge,
-		C2:         h.config.C2.Public(),
-		Robots:     h.config.Robots,
-		MultiAgent: multiPub,
+		OpenAI:       h.config.OpenAI,
+		Vision:       h.config.Vision,
+		FOFA:         h.config.FOFA,
+		MCP:          h.config.MCP,
+		Tools:        tools,
+		Agent:        h.config.Agent,
+		Hitl:         h.config.Hitl,
+		Knowledge:    h.config.Knowledge,
+		AgentRuntime: h.config.AgentRuntimeEffective(),
+		CodexRuntime: h.config.AgentRuntimeEffective(),
+		C2:           h.config.C2.Public(),
+		Robots:       h.config.Robots,
+		MultiAgent:   multiPub,
 	})
 }
 
@@ -433,8 +439,8 @@ func (h *ConfigHandler) GetTools(c *gin.Context) {
 	roleName := c.Query("role")
 	var roleToolsSet map[string]bool // 角色配置的工具集合
 	var roleUsesAllTools bool = true // 角色是否使用所有工具（默认角色）
-	if roleName != "" && roleName != "默认" && roles != nil {
-		if role, exists := roles[roleName]; exists && role.Enabled {
+	if strings.TrimSpace(roleName) != "" && roles != nil {
+		if role, _, exists := resolveConfiguredRole(h.config, roleName); exists {
 			if len(role.Tools) > 0 {
 				// 角色配置了工具列表，只使用这些工具
 				roleToolsSet = make(map[string]bool)
@@ -673,16 +679,16 @@ func (h *ConfigHandler) GetTools(c *gin.Context) {
 
 // UpdateConfigRequest 更新配置请求
 type UpdateConfigRequest struct {
-	OpenAI     *config.OpenAIConfig         `json:"openai,omitempty"`
-	Vision     *config.VisionConfig         `json:"vision,omitempty"`
-	FOFA       *config.FofaConfig           `json:"fofa,omitempty"`
-	MCP        *config.MCPConfig            `json:"mcp,omitempty"`
-	Tools      []ToolEnableStatus           `json:"tools,omitempty"`
-	Agent      *AgentConfigUpdate           `json:"agent,omitempty"`
-	Knowledge  *config.KnowledgeConfig      `json:"knowledge,omitempty"`
-	Robots     *config.RobotsConfig         `json:"robots,omitempty"`
-	MultiAgent *config.MultiAgentAPIUpdate  `json:"multi_agent,omitempty"`
-	C2         *config.C2APIUpdate           `json:"c2,omitempty"`
+	OpenAI     *config.OpenAIConfig        `json:"openai,omitempty"`
+	Vision     *config.VisionConfig        `json:"vision,omitempty"`
+	FOFA       *config.FofaConfig          `json:"fofa,omitempty"`
+	MCP        *config.MCPConfig           `json:"mcp,omitempty"`
+	Tools      []ToolEnableStatus          `json:"tools,omitempty"`
+	Agent      *AgentConfigUpdate          `json:"agent,omitempty"`
+	Knowledge  *config.KnowledgeConfig     `json:"knowledge,omitempty"`
+	Robots     *config.RobotsConfig        `json:"robots,omitempty"`
+	MultiAgent *config.MultiAgentAPIUpdate `json:"multi_agent,omitempty"`
+	C2         *config.C2APIUpdate         `json:"c2,omitempty"`
 }
 
 // AgentConfigUpdate 用于 PATCH /api/config 的 agent 段：仅 JSON 中出现的字段（指针非 nil）覆盖内存配置。
@@ -1070,24 +1076,40 @@ func (h *ConfigHandler) TestOpenAI(c *gin.Context) {
 
 // ListModelsRequest 获取模型列表请求（OpenAI 兼容 GET /models）。
 type ListModelsRequest struct {
-	Provider string `json:"provider"`
-	BaseURL  string `json:"base_url"`
-	APIKey   string `json:"api_key"`
+	Provider     string `json:"provider"`
+	BaseURL      string `json:"base_url"`
+	BaseURLCamel string `json:"baseURL"`
+	BaseURLLower string `json:"baseUrl"`
+	APIKey       string `json:"api_key"`
+	APIKeyCamel  string `json:"apiKey"`
 }
 
 // ListModels 代理调用上游 GET /models，返回可用模型 id 列表。
 func (h *ConfigHandler) ListModels(c *gin.Context) {
 	var req ListModelsRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求参数: " + err.Error()})
-		return
+	if c.Request.Body != nil {
+		body, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "读取请求参数失败: " + err.Error()})
+			return
+		}
+		if len(bytes.TrimSpace(body)) > 0 {
+			if err := json.Unmarshal(body, &req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求参数: " + err.Error()})
+				return
+			}
+		}
 	}
 
-	provider := strings.TrimSpace(req.Provider)
-	if provider == "" {
-		provider = "openai"
-	}
-	if strings.EqualFold(provider, "claude") {
+	h.mu.RLock()
+	current := h.config.OpenAI
+	h.mu.RUnlock()
+
+	provider := firstNonEmptyString(req.Provider, current.Provider, "openai")
+	apiKey := firstNonEmptyString(req.APIKey, req.APIKeyCamel, current.APIKey)
+	baseURL := firstNonEmptyString(req.BaseURL, req.BaseURLCamel, req.BaseURLLower, current.BaseURL)
+
+	if strings.EqualFold(provider, "claude") || strings.EqualFold(provider, "anthropic") {
 		c.JSON(http.StatusOK, gin.H{
 			"success":   false,
 			"supported": false,
@@ -1096,12 +1118,12 @@ func (h *ConfigHandler) ListModels(c *gin.Context) {
 		return
 	}
 
-	if strings.TrimSpace(req.APIKey) == "" {
+	if strings.TrimSpace(apiKey) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "API Key 不能为空"})
 		return
 	}
 
-	baseURL := strings.TrimSuffix(strings.TrimSpace(req.BaseURL), "/")
+	baseURL = strings.TrimSuffix(strings.TrimSpace(baseURL), "/")
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
@@ -1109,7 +1131,7 @@ func (h *ConfigHandler) ListModels(c *gin.Context) {
 	tmpCfg := &config.OpenAIConfig{
 		Provider: provider,
 		BaseURL:  baseURL,
-		APIKey:   strings.TrimSpace(req.APIKey),
+		APIKey:   strings.TrimSpace(apiKey),
 	}
 	client := openai.NewClient(tmpCfg, nil, h.logger)
 
@@ -1140,6 +1162,16 @@ func (h *ConfigHandler) ListModels(c *gin.Context) {
 		"models":    models,
 		"count":     len(models),
 	})
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // TestVisionRequest 测试 Vision 模型连接；vision.api_key/base_url 留空时可传 openai 段作回退。
@@ -1457,7 +1489,7 @@ func (h *ConfigHandler) ApplyConfig(c *gin.Context) {
 			Result:   "success",
 			Message:  "配置已应用",
 			Detail: map[string]interface{}{
-				"tools_count":      len(h.config.Security.Tools),
+				"tools_count":       len(h.config.Security.Tools),
 				"knowledge_enabled": h.config.Knowledge.Enabled,
 				"c2_enabled":        h.config.C2.EnabledEffective(),
 			},
