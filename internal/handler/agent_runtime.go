@@ -162,6 +162,8 @@ func (h *AgentHandler) AgentRuntimeLoopStream(c *gin.Context) {
 		emitStartupEvent("done", "", map[string]interface{}{"conversationId": conversationID})
 		return
 	}
+	h.tasks.SetTaskAgentMode(conversationID, "agent_runtime")
+	h.tasks.SetTaskAssistantMessageID(conversationID, assistantMessageID)
 
 	run := func(ctx context.Context, cancel context.CancelCauseFunc, emit func(eventType, message string, data interface{})) string {
 		return h.executeAgentRuntimeStreamTurn(ctx, cancel, conversationID, assistantMessageID, req, prep.FinalMessage, prep.RoleTools, prep.History, emit)
@@ -170,7 +172,7 @@ func (h *AgentHandler) AgentRuntimeLoopStream(c *gin.Context) {
 		taskCtx, timeoutCancel := context.WithTimeout(baseCtx, 600*time.Minute)
 		go func() {
 			defer timeoutCancel()
-			status := run(taskCtx, cancelWithCause, func(eventType, message string, data interface{}) {
+			emitRuntimeTaskEvent := func(eventType, message string, data interface{}) {
 				if publishConversationID != "" && h.taskEventBus != nil {
 					ev := StreamEvent{Type: eventType, Message: message, Data: data}
 					b, err := json.Marshal(ev)
@@ -181,7 +183,11 @@ func (h *AgentHandler) AgentRuntimeLoopStream(c *gin.Context) {
 					line = append(line, '\n', '\n')
 					h.taskEventBus.Publish(publishConversationID, line)
 				}
-			})
+			}
+			if runtimeCfg.TransportEffective() == "grpc" {
+				emitRuntimeTaskEvent = func(string, string, interface{}) {}
+			}
+			status := run(taskCtx, cancelWithCause, emitRuntimeTaskEvent)
 			h.tasks.FinishTask(conversationID, status)
 			cancelWithCause(nil)
 		}()
@@ -246,7 +252,7 @@ func (h *AgentHandler) executeAgentRuntimeStreamTurn(
 		ConversationID:   conversationID,
 		RuntimeSessionID: runtimeSessionID,
 		Message:          finalMessage,
-		Context:          h.agentRuntimeContext(conversationID, req, roleTools, history),
+		Context:          agentRuntimeContextWithAssistantMessageID(h.agentRuntimeContext(conversationID, req, roleTools, history), assistantMessageID),
 	}, func(event agentruntime.Event) error {
 		if event.RuntimeSessionID != "" {
 			lastRuntimeSessionID = event.RuntimeSessionID
@@ -374,7 +380,7 @@ func (h *AgentHandler) runAgentRuntimeTurn(
 		ConversationID:   conversationID,
 		RuntimeSessionID: runtimeSessionID,
 		Message:          message,
-		Context:          h.agentRuntimeContext(conversationID, req, roleTools, history),
+		Context:          agentRuntimeContextWithAssistantMessageID(h.agentRuntimeContext(conversationID, req, roleTools, history), assistantMessageID),
 	}, func(event agentruntime.Event) error {
 		if event.RuntimeSessionID != "" {
 			lastRuntimeSessionID = event.RuntimeSessionID
@@ -520,6 +526,83 @@ func (h *AgentHandler) handleAgentRuntimeEvent(
 	return nil
 }
 
+func (h *AgentHandler) agentRuntimeReplayStreamEvent(event agentruntime.Event) StreamEvent {
+	data := h.agentRuntimeEventData(event)
+	data["replay"] = true
+	data["agentMode"] = "agent_runtime"
+	if event.EventID != "" {
+		data["runtimeEventId"] = event.EventID
+	}
+	eventType := "progress"
+	message := "Agent Runtime event: " + event.Type
+	switch event.Type {
+	case "session_started":
+		message = "Agent Runtime session 已启动"
+	case "turn_started":
+		message = "Agent Runtime turn 已启动"
+	case "plan_updated":
+		eventType = "planning"
+		message = h.agentRuntimePlanSummary(event)
+	case "reasoning_delta":
+		eventType = "reasoning_chain_stream_delta"
+		message = event.Delta
+		data["streamId"] = event.TurnID
+		if event.Accumulated != "" {
+			data[openai.SSEAccumulatedKey] = event.Accumulated
+		}
+	case "assistant_progress_update":
+		eventType = "assistant_progress_update"
+		message = event.Message
+	case "runtime_status_update":
+		eventType = "runtime_status_update"
+		message = event.Message
+	case "assistant_delta":
+		eventType = "response_delta"
+		message = event.Delta
+		if event.Accumulated != "" {
+			data[openai.SSEAccumulatedKey] = event.Accumulated
+		}
+	case "tool_call_started":
+		eventType = "tool_call"
+		message = fmt.Sprintf("调用工具: %s", event.ToolName)
+	case "tool_call_delta":
+		eventType = "tool_result_delta"
+		message = event.Delta
+	case "tool_call_completed":
+		eventType = "tool_result"
+		message = event.Result
+	case "tool_call_failed":
+		eventType = "tool_result"
+		message = event.Error
+	case "approval_requested":
+		eventType = "hitl_approval_requested"
+		message = event.Message
+	case "approval_resolved":
+		eventType = "hitl_approval_resolved"
+		message = event.Decision
+	case "follow_up_started":
+		message = "Agent Runtime follow-up: " + event.Reason
+	case "compaction_started":
+		message = "Agent Runtime 正在压缩上下文"
+	case "compaction_completed":
+		message = "Agent Runtime 上下文压缩完成"
+	case "stop_hook_continued":
+		message = "Agent Runtime stop hook 继续执行: " + event.Reason
+	case "turn_completed":
+		message = "Agent Runtime turn 已完成"
+	case "turn_aborted":
+		eventType = "cancelled"
+		message = "Agent Runtime turn 已中止: " + event.Reason
+	case "runtime_error":
+		eventType = "error"
+		message = event.Message
+	case "command_completed":
+		eventType = "runtime_status_update"
+		message = "Agent Runtime command 已完成"
+	}
+	return StreamEvent{Type: eventType, Message: message, Data: data}
+}
+
 func (h *AgentHandler) resumeAgentRuntimeApproval(ctx context.Context, requestID, decision, comment string) error {
 	if h == nil || h.config == nil || h.db == nil {
 		return errors.New("agent runtime handler is not initialized")
@@ -534,11 +617,15 @@ func (h *AgentHandler) resumeAgentRuntimeApproval(ctx context.Context, requestID
 	if interrupt == nil {
 		return fmt.Errorf("HITL interrupt not found: %s", requestID)
 	}
+	var runtimeSessionID string
 	runtimeSession, err := h.db.GetAgentRuntimeSession(interrupt.ConversationID)
-	if err != nil {
+	if err != nil && h.agentRuntimeConfig().TransportEffective() != "grpc" {
 		return err
 	}
-	if runtimeSession == nil || strings.TrimSpace(runtimeSession.RuntimeSessionID) == "" {
+	if runtimeSession != nil {
+		runtimeSessionID = strings.TrimSpace(runtimeSession.RuntimeSessionID)
+	}
+	if runtimeSessionID == "" && h.agentRuntimeConfig().TransportEffective() != "grpc" {
 		return fmt.Errorf("Agent runtime session not found for conversation %s", interrupt.ConversationID)
 	}
 
@@ -563,14 +650,14 @@ func (h *AgentHandler) resumeAgentRuntimeApproval(ctx context.Context, requestID
 	}
 	cmdCtx, cancel := context.WithTimeout(ctx, 600*time.Minute)
 	defer cancel()
-	err = client.StartTurn(cmdCtx, agentruntime.Command{
+	err = client.ResumeApproval(cmdCtx, agentruntime.Command{
 		Type:             "approval_response",
 		ConversationID:   interrupt.ConversationID,
-		RuntimeSessionID: runtimeSession.RuntimeSessionID,
+		RuntimeSessionID: runtimeSessionID,
 		RequestID:        requestID,
 		Decision:         decision,
 		Message:          comment,
-		Context:          h.agentRuntimeContext(interrupt.ConversationID, ChatRequest{}, nil),
+		Context:          agentRuntimeContextWithAssistantMessageID(h.agentRuntimeContext(interrupt.ConversationID, ChatRequest{}, nil), interrupt.MessageID),
 	}, func(event agentruntime.Event) error {
 		return h.handleAgentRuntimeEvent(progress, interrupt.ConversationID, interrupt.MessageID, event, &finalResponse, &reasoning, &completed, &aborted, &pendingApproval)
 	})
@@ -578,7 +665,7 @@ func (h *AgentHandler) resumeAgentRuntimeApproval(ctx context.Context, requestID
 		return err
 	}
 	if aborted {
-		_ = h.db.MarkAgentRuntimeTurnFinished(interrupt.ConversationID, runtimeSession.RuntimeSessionID, "", "aborted")
+		_ = h.db.MarkAgentRuntimeTurnFinished(interrupt.ConversationID, runtimeSessionID, "", "aborted")
 		return nil
 	}
 	if pendingApproval {
@@ -596,7 +683,7 @@ func (h *AgentHandler) resumeAgentRuntimeApproval(ctx context.Context, requestID
 			return err
 		}
 	}
-	_ = h.db.MarkAgentRuntimeTurnFinished(interrupt.ConversationID, runtimeSession.RuntimeSessionID, "", "completed")
+	_ = h.db.MarkAgentRuntimeTurnFinished(interrupt.ConversationID, runtimeSessionID, "", "completed")
 	progress("response", response, map[string]interface{}{
 		"conversationId":     interrupt.ConversationID,
 		"assistantMessageId": interrupt.MessageID,
@@ -609,11 +696,14 @@ func (h *AgentHandler) resumeAgentRuntimeApproval(ctx context.Context, requestID
 func (h *AgentHandler) agentRuntimeEventData(event agentruntime.Event) map[string]interface{} {
 	data := map[string]interface{}{
 		"source":           "agent_runtime",
-		"runtimeEventType": event.Type,
+		"runtimeEventType": firstRuntimeString(event.RuntimeEventType, event.Type),
 		"runtimeTrace":     agentRuntimeTraceData(event),
 	}
 	if event.ConversationID != "" {
 		data["conversationId"] = event.ConversationID
+	}
+	if event.EventID != "" {
+		data["runtimeEventId"] = event.EventID
 	}
 	if event.RuntimeSessionID != "" {
 		data["runtimeSessionId"] = event.RuntimeSessionID
@@ -626,6 +716,16 @@ func (h *AgentHandler) agentRuntimeEventData(event agentruntime.Event) map[strin
 	}
 	if event.Delta != "" {
 		data["delta"] = event.Delta
+	}
+	if event.Accumulated != "" {
+		data[openai.SSEAccumulatedKey] = event.Accumulated
+	}
+	if event.Response != "" {
+		data["response"] = event.Response
+		data[openai.SSEAccumulatedKey] = event.Response
+	}
+	if event.AssistantMessageID != "" {
+		data["assistantMessageId"] = event.AssistantMessageID
 	}
 	if event.ToolCallID != "" {
 		data["toolCallId"] = event.ToolCallID
@@ -667,16 +767,37 @@ func (h *AgentHandler) agentRuntimeEventData(event agentruntime.Event) map[strin
 	if event.ReplacementMessageCount > 0 {
 		data["replacementMessageCount"] = event.ReplacementMessageCount
 	}
+	if event.PayloadJSON != "" {
+		var payload interface{}
+		if err := json.Unmarshal([]byte(event.PayloadJSON), &payload); err == nil {
+			data["payload"] = payload
+		}
+	}
+	if event.OccurredAt != "" {
+		data["occurredAt"] = event.OccurredAt
+	}
+	if event.Sequence != "" {
+		data["sequence"] = event.Sequence
+	}
 	return data
 }
 
 func agentRuntimeTraceData(event agentruntime.Event) map[string]interface{} {
+	if strings.TrimSpace(event.RuntimeTraceJSON) != "" {
+		var trace map[string]interface{}
+		if err := json.Unmarshal([]byte(event.RuntimeTraceJSON), &trace); err == nil && trace != nil {
+			return trace
+		}
+	}
 	trace := map[string]interface{}{
 		"schema": "cyberstrike.agent_runtime.trace.v1",
-		"event":  event.Type,
+		"event":  firstRuntimeString(event.RuntimeEventType, event.Type),
 	}
 	if event.ConversationID != "" {
 		trace["conversationId"] = event.ConversationID
+	}
+	if event.EventID != "" {
+		trace["eventId"] = event.EventID
 	}
 	if event.RuntimeSessionID != "" {
 		trace["runtimeSessionId"] = event.RuntimeSessionID
@@ -768,7 +889,26 @@ func agentRuntimeTraceData(event agentruntime.Event) map[string]interface{} {
 	if event.Message != "" {
 		trace["message"] = event.Message
 	}
+	if event.Response != "" {
+		trace["response"] = event.Response
+		trace[openai.SSEAccumulatedKey] = event.Response
+	}
+	if event.Accumulated != "" {
+		trace[openai.SSEAccumulatedKey] = event.Accumulated
+	}
+	if event.AssistantMessageID != "" {
+		trace["assistantMessageId"] = event.AssistantMessageID
+	}
 	return trace
+}
+
+func firstRuntimeString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (h *AgentHandler) agentRuntimePlanSummary(event agentruntime.Event) string {
@@ -801,25 +941,81 @@ func writeStreamEvent(c *gin.Context, ev StreamEvent) {
 	}
 }
 
-func (h *AgentHandler) agentRuntimeClient() *agentruntime.PersistentClient {
+func (h *AgentHandler) agentRuntimeClient() agentruntime.RuntimeClient {
 	if h == nil || h.config == nil {
-		return &agentruntime.PersistentClient{}
+		return agentruntime.NewJSONLPersistentClient("", "")
 	}
 	runtimeCfg := h.agentRuntimeConfig()
 	binary := runtimeCfg.BinaryPathEffective(h.configDir())
 	workDir := h.agentRuntimeWorkDir()
+	transport := runtimeCfg.TransportEffective()
+	grpcListen := runtimeCfg.GRPCListenEffective()
+	redisAddr := strings.TrimSpace(runtimeCfg.RedisAddr)
+	redisPrefix := runtimeCfg.RedisPrefixEffective()
 	h.agentRuntimeMu.Lock()
 	defer h.agentRuntimeMu.Unlock()
-	if h.agentRuntimePersistent != nil && h.agentRuntimeBinary == binary && h.agentRuntimeClientWorkDir == workDir {
-		return h.agentRuntimePersistent
+	if h.agentRuntimeClientCached != nil &&
+		h.agentRuntimeBinary == binary &&
+		h.agentRuntimeClientWorkDir == workDir &&
+		h.agentRuntimeTransport == transport &&
+		h.agentRuntimeGRPCListen == grpcListen &&
+		h.agentRuntimeRedisAddr == redisAddr &&
+		h.agentRuntimeRedisPrefix == redisPrefix {
+		return h.agentRuntimeClientCached
 	}
-	if h.agentRuntimePersistent != nil {
-		_ = h.agentRuntimePersistent.Close()
+	if h.agentRuntimeClientCached != nil {
+		_ = h.agentRuntimeClientCached.Close()
 	}
-	h.agentRuntimePersistent = &agentruntime.PersistentClient{BinaryPath: binary, WorkDir: workDir}
+	if transport == "grpc" {
+		h.agentRuntimeClientCached = agentruntime.NewGRPCRuntimeClient(binary, workDir, grpcListen, redisAddr, redisPrefix)
+	} else {
+		h.agentRuntimeClientCached = agentruntime.NewJSONLPersistentClient(binary, workDir)
+	}
 	h.agentRuntimeBinary = binary
 	h.agentRuntimeClientWorkDir = workDir
-	return h.agentRuntimePersistent
+	h.agentRuntimeTransport = transport
+	h.agentRuntimeGRPCListen = grpcListen
+	h.agentRuntimeRedisAddr = redisAddr
+	h.agentRuntimeRedisPrefix = redisPrefix
+	return h.agentRuntimeClientCached
+}
+
+func (h *AgentHandler) agentRuntimeClientIfStarted() agentruntime.RuntimeClient {
+	if h == nil {
+		return nil
+	}
+	h.agentRuntimeMu.Lock()
+	defer h.agentRuntimeMu.Unlock()
+	if h.agentRuntimeClientCached == nil || !h.agentRuntimeClientCached.IsStarted() {
+		return nil
+	}
+	return h.agentRuntimeClientCached
+}
+
+func (h *AgentHandler) agentRuntimeStateReader() agentruntime.StateReader {
+	if h == nil || h.config == nil {
+		return nil
+	}
+	runtimeCfg := h.agentRuntimeConfig()
+	if !runtimeCfg.Enabled || runtimeCfg.TransportEffective() != "grpc" {
+		return nil
+	}
+	redisAddr := strings.TrimSpace(runtimeCfg.RedisAddr)
+	if redisAddr == "" {
+		return nil
+	}
+	redisPrefix := runtimeCfg.RedisPrefixEffective()
+	h.agentRuntimeMu.Lock()
+	defer h.agentRuntimeMu.Unlock()
+	if h.agentRuntimeStateReaderCached != nil &&
+		h.agentRuntimeStateRedisAddr == redisAddr &&
+		h.agentRuntimeStateRedisPrefix == redisPrefix {
+		return h.agentRuntimeStateReaderCached
+	}
+	h.agentRuntimeStateReaderCached = agentruntime.NewRedisStateReader(redisAddr, redisPrefix)
+	h.agentRuntimeStateRedisAddr = redisAddr
+	h.agentRuntimeStateRedisPrefix = redisPrefix
+	return h.agentRuntimeStateReaderCached
 }
 
 func (h *AgentHandler) configDir() string {
@@ -901,7 +1097,12 @@ func (h *AgentHandler) agentRuntimeContext(conversationID string, req ChatReques
 	ctx["mcp_auth_header_value"] = strings.TrimSpace(h.config.MCP.AuthHeaderValue)
 	ctx["mcp_tools"] = h.agentRuntimeMCPTools(roleTools)
 	ctx["skills_enabled"] = runtimeCfg.SkillsEnabled
-	ctx["skills"] = h.agentRuntimeSkills()
+	ctx["skills_dir"] = h.agentRuntimeSkillsDir()
+	ctx["skills_source"] = runtimeCfg.SkillsSourceEffective()
+	ctx["skills_allowlist"] = h.agentRuntimeSkillsAllowlist(roleTools)
+	if runtimeCfg.SkillsSourceEffective() == "go_context" {
+		ctx["skills"] = h.agentRuntimeSkills()
+	}
 	ctx["knowledge_enabled"] = runtimeCfg.KnowledgeEnabled
 	ctx["knowledge_snippets"] = h.agentRuntimeKnowledgeSnippets(conversationID, req.Message)
 	ctx["approval_enabled"] = runtimeCfg.ApprovalEnabled && req.Hitl != nil && req.Hitl.Enabled
@@ -909,6 +1110,17 @@ func (h *AgentHandler) agentRuntimeContext(conversationID string, req ChatReques
 	ctx["compaction_enabled"] = runtimeCfg.CompactionEnabled
 	ctx["compaction_threshold_chars"] = runtimeCfg.CompactionThresholdCharsEffective()
 	ctx["compaction_keep_recent_messages"] = runtimeCfg.CompactionKeepRecentMessagesEffective()
+	return ctx
+}
+
+func agentRuntimeContextWithAssistantMessageID(ctx map[string]interface{}, assistantMessageID string) map[string]interface{} {
+	if ctx == nil {
+		ctx = map[string]interface{}{}
+	}
+	if assistantMessageID = strings.TrimSpace(assistantMessageID); assistantMessageID != "" {
+		ctx["assistant_message_id"] = assistantMessageID
+		ctx["assistantMessageId"] = assistantMessageID
+	}
 	return ctx
 }
 
@@ -966,12 +1178,52 @@ func (h *AgentHandler) agentRuntimeApprovalAllowlist(req ChatRequest) []string {
 	return out
 }
 
+func (h *AgentHandler) agentRuntimeSkillsDir() string {
+	if h == nil || h.config == nil {
+		return ""
+	}
+	return skillpackage.SkillsRootFromConfig(h.config.SkillsDir, h.configPath)
+}
+
+func (h *AgentHandler) agentRuntimeSkillsAllowlist(roleTools []string) []string {
+	_ = h
+	const skillPrefix = "skill:"
+	const skillQualifiedPrefix = "skill::"
+	seen := make(map[string]struct{})
+	out := make([]string, 0)
+	for _, item := range roleTools {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.HasPrefix(lower, skillQualifiedPrefix) {
+			trimmed = strings.TrimSpace(trimmed[len(skillQualifiedPrefix):])
+			lower = strings.ToLower(trimmed)
+		} else if strings.HasPrefix(lower, skillPrefix) {
+			trimmed = strings.TrimSpace(trimmed[len(skillPrefix):])
+			lower = strings.ToLower(trimmed)
+		} else {
+			continue
+		}
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := seen[lower]; ok {
+			continue
+		}
+		seen[lower] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
 func (h *AgentHandler) agentRuntimeSkills() map[string]interface{} {
 	out := map[string]interface{}{}
 	if h == nil || h.config == nil || !h.agentRuntimeConfig().SkillsEnabled {
 		return out
 	}
-	root := skillpackage.SkillsRootFromConfig(h.config.SkillsDir, h.configPath)
+	root := h.agentRuntimeSkillsDir()
 	names, err := skillpackage.ListSkillDirNames(root)
 	if err != nil {
 		if h.logger != nil {

@@ -796,6 +796,12 @@ func (a *App) Shutdown() {
 
 	a.shutdownC2()
 
+	if a.agentHandler != nil {
+		if err := a.agentHandler.Close(); err != nil {
+			a.logger.Logger.Warn("关闭 Agent Runtime 客户端失败", zap.Error(err))
+		}
+	}
+
 	// 停止所有外部MCP客户端
 	if a.externalMCPMgr != nil {
 		a.externalMCPMgr.StopAll()

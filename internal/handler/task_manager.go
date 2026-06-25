@@ -25,11 +25,13 @@ func shouldPersistEinoAgentTraceAfterRunError(baseCtx context.Context) bool {
 
 // AgentTask 描述正在运行的Agent任务
 type AgentTask struct {
-	ConversationID string    `json:"conversationId"`
-	Message        string    `json:"message,omitempty"`
-	StartedAt      time.Time `json:"startedAt"`
-	Status         string    `json:"status"`
-	CancellingAt   time.Time `json:"-"` // 进入 cancelling 状态的时间，用于清理长时间卡住的任务
+	ConversationID     string    `json:"conversationId"`
+	Message            string    `json:"message,omitempty"`
+	StartedAt          time.Time `json:"startedAt"`
+	Status             string    `json:"status"`
+	AgentMode          string    `json:"agentMode,omitempty"`
+	AssistantMessageID string    `json:"assistantMessageId,omitempty"`
+	CancellingAt       time.Time `json:"-"` // 进入 cancelling 状态的时间，用于清理长时间卡住的任务
 
 	// ActiveMCPExecutionID 当前正在执行的 MCP 工具 executionId（仅内存，供「中断并继续」= 仅掐当前工具）
 	ActiveMCPExecutionID string `json:"-"`
@@ -180,6 +182,45 @@ func (m *AgentTaskManager) GetTask(conversationID string) *AgentTask {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.tasks[conversationID]
+}
+
+func (m *AgentTaskManager) SetTaskAgentMode(conversationID, agentMode string) {
+	conversationID = strings.TrimSpace(conversationID)
+	agentMode = strings.TrimSpace(agentMode)
+	if conversationID == "" || agentMode == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if task, ok := m.tasks[conversationID]; ok && task != nil {
+		task.AgentMode = agentMode
+	}
+}
+
+func (m *AgentTaskManager) SetTaskAssistantMessageID(conversationID, assistantMessageID string) {
+	conversationID = strings.TrimSpace(conversationID)
+	assistantMessageID = strings.TrimSpace(assistantMessageID)
+	if conversationID == "" || assistantMessageID == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if task, ok := m.tasks[conversationID]; ok && task != nil {
+		task.AssistantMessageID = assistantMessageID
+	}
+}
+
+func (m *AgentTaskManager) TaskAgentMode(conversationID string) string {
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if task, ok := m.tasks[conversationID]; ok && task != nil {
+		return strings.TrimSpace(task.AgentMode)
+	}
+	return ""
 }
 
 // runStuckCancellingCleanup 定期将长时间处于「取消中」的任务强制结束，避免卡住无法发新消息
@@ -365,10 +406,12 @@ func (m *AgentTaskManager) GetActiveTasks() []*AgentTask {
 	result := make([]*AgentTask, 0, len(m.tasks))
 	for _, task := range m.tasks {
 		result = append(result, &AgentTask{
-			ConversationID: task.ConversationID,
-			Message:        task.Message,
-			StartedAt:      task.StartedAt,
-			Status:         task.Status,
+			ConversationID:     task.ConversationID,
+			Message:            task.Message,
+			StartedAt:          task.StartedAt,
+			Status:             task.Status,
+			AgentMode:          task.AgentMode,
+			AssistantMessageID: task.AssistantMessageID,
 		})
 	}
 	return result

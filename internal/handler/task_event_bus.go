@@ -3,6 +3,8 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -150,6 +152,15 @@ func ensureTaskEventConversationID(conversationID string, line []byte) []byte {
 	if conversationID == "" || len(line) == 0 {
 		return line
 	}
+	return ensureTaskEventDataString(line, "conversationId", conversationID)
+}
+
+func ensureTaskEventDataString(line []byte, key, value string) []byte {
+	key = string(bytes.TrimSpace([]byte(key)))
+	value = string(bytes.TrimSpace([]byte(value)))
+	if key == "" || value == "" || len(line) == 0 {
+		return line
+	}
 	trimmed := bytes.TrimSpace(line)
 	if !bytes.HasPrefix(trimmed, []byte("data:")) {
 		return line
@@ -167,8 +178,8 @@ func ensureTaskEventConversationID(conversationID string, line []byte) []byte {
 		data = map[string]interface{}{}
 		envelope["data"] = data
 	}
-	if _, exists := data["conversationId"]; !exists {
-		data["conversationId"] = conversationID
+	if existing, exists := data[key]; !exists || strings.TrimSpace(fmt.Sprint(existing)) == "" {
+		data[key] = value
 	}
 	next, err := json.Marshal(envelope)
 	if err != nil {

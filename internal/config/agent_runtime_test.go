@@ -58,6 +58,47 @@ func TestAgentRuntimeCompactionDefaults(t *testing.T) {
 	}
 }
 
+func TestAgentRuntimeTransportDefaults(t *testing.T) {
+	cfg := AgentRuntimeConfig{}
+	if got := cfg.TransportEffective(); got != "jsonl" {
+		t.Fatalf("TransportEffective = %q, want jsonl", got)
+	}
+	if got := cfg.GRPCListenEffective(); got != "127.0.0.1:0" {
+		t.Fatalf("GRPCListenEffective = %q, want 127.0.0.1:0", got)
+	}
+	if got := cfg.RedisPrefixEffective(); got != "csai:agent_runtime:" {
+		t.Fatalf("RedisPrefixEffective = %q, want csai:agent_runtime:", got)
+	}
+
+	cfg.Transport = "grpc"
+	cfg.GRPCListen = "127.0.0.1:19090"
+	cfg.RedisPrefix = "custom:"
+	if got := cfg.TransportEffective(); got != "grpc" {
+		t.Fatalf("TransportEffective override = %q, want grpc", got)
+	}
+	if got := cfg.GRPCListenEffective(); got != "127.0.0.1:19090" {
+		t.Fatalf("GRPCListenEffective override = %q, want 127.0.0.1:19090", got)
+	}
+	if got := cfg.RedisPrefixEffective(); got != "custom:" {
+		t.Fatalf("RedisPrefixEffective override = %q, want custom:", got)
+	}
+}
+
+func TestAgentRuntimeSkillsSourceDefaultsToRustDir(t *testing.T) {
+	cfg := AgentRuntimeConfig{}
+	if got := cfg.SkillsSourceEffective(); got != "rust_dir" {
+		t.Fatalf("SkillsSourceEffective = %q, want rust_dir", got)
+	}
+	cfg.SkillsSource = "go_context"
+	if got := cfg.SkillsSourceEffective(); got != "go_context" {
+		t.Fatalf("SkillsSourceEffective override = %q, want go_context", got)
+	}
+	cfg.SkillsSource = "invalid"
+	if got := cfg.SkillsSourceEffective(); got != "rust_dir" {
+		t.Fatalf("SkillsSourceEffective invalid = %q, want rust_dir", got)
+	}
+}
+
 func TestAgentRuntimeEffectiveFallsBackToDeprecatedCodexAlias(t *testing.T) {
 	cfg := Config{CodexRuntime: AgentRuntimeConfig{Enabled: true, MaxSteps: 12}}
 	got := cfg.AgentRuntimeEffective()

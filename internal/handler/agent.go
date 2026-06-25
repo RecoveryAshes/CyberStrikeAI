@@ -187,13 +187,20 @@ type AgentHandler struct {
 	batchRunnerMu      sync.Mutex
 	batchRunning       map[string]struct{}
 	// hitlWhitelistSaver 侧栏「应用」HITL 时将会话增量白名单合并写入 config.yaml（可选）
-	hitlWhitelistSaver         HitlToolWhitelistSaver
-	audit                      *audit.Service
-	agentRuntimeMu             sync.Mutex
-	agentRuntimePersistent     *agentruntime.PersistentClient
-	agentRuntimeBinary         string
-	agentRuntimeClientWorkDir  string
-	conversationTitleGenerator conversationTitleGenerator
+	hitlWhitelistSaver            HitlToolWhitelistSaver
+	audit                         *audit.Service
+	agentRuntimeMu                sync.Mutex
+	agentRuntimeClientCached      agentruntime.RuntimeClient
+	agentRuntimeStateReaderCached agentruntime.StateReader
+	agentRuntimeBinary            string
+	agentRuntimeTransport         string
+	agentRuntimeGRPCListen        string
+	agentRuntimeRedisAddr         string
+	agentRuntimeRedisPrefix       string
+	agentRuntimeStateRedisAddr    string
+	agentRuntimeStateRedisPrefix  string
+	agentRuntimeClientWorkDir     string
+	conversationTitleGenerator    conversationTitleGenerator
 }
 
 // SetAudit wires platform audit logging.
@@ -237,6 +244,29 @@ func NewAgentHandler(agent *agent.Agent, db *database.DB, cfg *config.Config, lo
 	}
 	go handler.batchQueueSchedulerLoop()
 	return handler
+}
+
+func (h *AgentHandler) Close() error {
+	if h == nil {
+		return nil
+	}
+	h.agentRuntimeMu.Lock()
+	client := h.agentRuntimeClientCached
+	h.agentRuntimeClientCached = nil
+	h.agentRuntimeStateReaderCached = nil
+	h.agentRuntimeBinary = ""
+	h.agentRuntimeTransport = ""
+	h.agentRuntimeGRPCListen = ""
+	h.agentRuntimeRedisAddr = ""
+	h.agentRuntimeRedisPrefix = ""
+	h.agentRuntimeStateRedisAddr = ""
+	h.agentRuntimeStateRedisPrefix = ""
+	h.agentRuntimeClientWorkDir = ""
+	h.agentRuntimeMu.Unlock()
+	if client == nil {
+		return nil
+	}
+	return client.Close()
 }
 
 func firstString(values []string) string {
@@ -862,6 +892,10 @@ func (h *AgentHandler) ProcessMessageForRobot(ctx context.Context, platform, con
 	if h.config != nil {
 		robotMode = config.NormalizeRobotAgentMode(h.config.MultiAgent)
 	}
+	if robotMode == "agent_runtime" {
+		h.tasks.SetTaskAgentMode(conversationID, "agent_runtime")
+		h.tasks.SetTaskAssistantMessageID(conversationID, assistantMessageID)
+	}
 	switch robotMode {
 	case "eino_single":
 		return h.runRobotEinoSingleWithRetry(taskCtx, conversationID, finalMessage, agentHistoryMessages, roleTools, progressCallback, assistantMessageID, &taskStatus)
@@ -1417,6 +1451,17 @@ func (h *AgentHandler) CancelAgentLoop(c *gin.Context) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "未找到正在执行的任务"})
 			return
 		}
+		if h.tasks.TaskAgentMode(req.ConversationID) == "agent_runtime" {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":             "Agent Runtime 暂不支持中断并继续，请停止当前任务后重新发送补充内容。",
+				"status":            "unsupported_continue_after",
+				"conversationId":    req.ConversationID,
+				"continueAfter":     true,
+				"agentMode":         "agent_runtime",
+				"interruptWithNote": strings.TrimSpace(req.Reason) != "",
+			})
+			return
+		}
 		execID := h.tasks.ActiveMCPExecutionID(req.ConversationID)
 		note := strings.TrimSpace(req.Reason)
 		if execID != "" {
@@ -1477,8 +1522,24 @@ func (h *AgentHandler) CancelAgentLoop(c *gin.Context) {
 	}
 
 	if !ok {
+		if h.interruptAgentRuntimeRunFromHTTP(c.Request.Context(), req.ConversationID, msg, false) {
+			c.JSON(http.StatusOK, gin.H{
+				"status":            "cancelling",
+				"conversationId":    req.ConversationID,
+				"message":           msg,
+				"continueAfter":     false,
+				"interruptWithNote": false,
+				"agentMode":         "agent_runtime",
+			})
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "未找到正在执行的任务"})
 		return
+	}
+	if h.tasks.TaskAgentMode(req.ConversationID) == "agent_runtime" {
+		if !h.interruptAgentRuntimeRunFromHTTP(c.Request.Context(), req.ConversationID, msg, false) && h.logger != nil {
+			h.logger.Warn("Agent Runtime gRPC cancel signal was not confirmed", zap.String("conversationId", req.ConversationID))
+		}
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -1490,16 +1551,45 @@ func (h *AgentHandler) CancelAgentLoop(c *gin.Context) {
 	})
 }
 
+func (h *AgentHandler) interruptAgentRuntimeRunFromHTTP(ctx context.Context, conversationID, reason string, continueAfter bool) bool {
+	if h == nil || h.config == nil || !h.agentRuntimeConfig().Enabled || h.agentRuntimeConfig().TransportEffective() != "grpc" {
+		return false
+	}
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" {
+		return false
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	client := h.agentRuntimeClientIfStarted()
+	if client == nil {
+		client = h.agentRuntimeClient()
+	}
+	if err := client.InterruptTurn(callCtx, conversationID, reason, continueAfter); err != nil {
+		if h.logger != nil {
+			h.logger.Warn("Agent Runtime gRPC cancel fallback failed", zap.Error(err), zap.String("conversationId", conversationID))
+		}
+		return false
+	}
+	return true
+}
+
 // SubscribeAgentTaskEvents GET SSE：订阅运行中任务的事件镜像（帧格式与 POST .../stream 一致），用于刷新页面或断线后接续 UI。
 // 带 conversationId 时只订阅该会话；不带时订阅所有运行中会话，供新前端用一个 EventSource 跟踪后台多会话 run。
 func (h *AgentHandler) SubscribeAgentTaskEvents(c *gin.Context) {
 	conversationID := strings.TrimSpace(c.Query("conversationId"))
-	if conversationID != "" && h.tasks.GetTask(conversationID) == nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "no active task for this conversation"})
-		return
+	afterEventID := strings.TrimSpace(c.Query("afterEventId"))
+	if afterEventID == "" {
+		afterEventID = strings.TrimSpace(c.Query("runtimeEventId"))
 	}
+	replayLimit := parsePositiveInt(c.Query("limit"), 100, 1000)
 	if h.taskEventBus == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "task event bus unavailable"})
+		return
+	}
+	runtimeBridge := h.newAgentRuntimeTaskEventBridge(conversationID, afterEventID, replayLimit)
+	if conversationID != "" && !runtimeBridge.HasConversation(c.Request.Context()) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "no active task for this conversation"})
 		return
 	}
 
@@ -1520,30 +1610,222 @@ func (h *AgentHandler) SubscribeAgentTaskEvents(c *gin.Context) {
 
 	flusher, _ := c.Writer.(http.Flusher)
 	ctx := c.Request.Context()
+	writeLine := func(line []byte) bool {
+		if _, err := c.Writer.Write(line); err != nil {
+			return false
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return true
+	}
+	runtimeBridge.Stream(ctx, ch, writeLine)
+}
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case chunk, ok := <-ch:
-			if !ok {
-				return
+func parsePositiveInt(raw string, fallback, max int) int {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return fallback
+	}
+	if max > 0 && value > max {
+		return max
+	}
+	return value
+}
+
+func taskEventRuntimeIdentity(line []byte) (string, string, string) {
+	trimmed := strings.TrimSpace(string(line))
+	if trimmed == "" || !strings.HasPrefix(trimmed, "data:") {
+		return "", "", ""
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return "", "", ""
+	}
+	var envelope struct {
+		Type string                 `json:"type"`
+		Data map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(payload), &envelope); err != nil || envelope.Data == nil {
+		return "", "", ""
+	}
+	return firstStringValue(envelope.Data["conversationId"], envelope.Data["conversation_id"]),
+		firstStringValue(envelope.Data["runtimeEventId"], envelope.Data["runtime_event_id"]),
+		firstRuntimeString(envelope.Type, firstStringValue(envelope.Data["runtimeEventType"], envelope.Data["runtime_event_type"]))
+}
+
+func taskEventIsTerminal(line []byte) bool {
+	trimmed := strings.TrimSpace(string(line))
+	if trimmed == "" || !strings.HasPrefix(trimmed, "data:") {
+		return false
+	}
+	payload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+	if payload == "" || payload == "[DONE]" {
+		return true
+	}
+	var envelope struct {
+		Type string                 `json:"type"`
+		Data map[string]interface{} `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(payload), &envelope); err != nil {
+		return false
+	}
+	eventType := strings.TrimSpace(envelope.Type)
+	if envelope.Data != nil {
+		if v := firstStringValue(envelope.Data["runtimeEventType"], envelope.Data["runtime_event_type"]); v != "" {
+			eventType = v
+		}
+	}
+	switch eventType {
+	case "turn_completed", "command_completed", "done", "response", "turn_aborted", "cancelled", "runtime_error", "error":
+		return true
+	default:
+		return false
+	}
+}
+
+func firstStringValue(values ...interface{}) string {
+	for _, value := range values {
+		switch v := value.(type) {
+		case string:
+			if s := strings.TrimSpace(v); s != "" {
+				return s
 			}
-			if _, err := c.Writer.Write(chunk); err != nil {
-				return
-			}
-			if flusher != nil {
-				flusher.Flush()
+		case fmt.Stringer:
+			if s := strings.TrimSpace(v.String()); s != "" && s != "<nil>" {
+				return s
 			}
 		}
 	}
+	return ""
+}
+
+func (h *AgentHandler) agentRuntimeReplayEventLine(event agentruntime.Event) ([]byte, bool) {
+	lines := h.agentRuntimeReplayEventLines(event)
+	if len(lines) == 0 {
+		return nil, false
+	}
+	return lines[0], true
+}
+
+func (h *AgentHandler) agentRuntimeReplayEventLines(event agentruntime.Event) [][]byte {
+	if strings.TrimSpace(event.Type) == "" {
+		return nil
+	}
+	events := []StreamEvent{h.agentRuntimeReplayStreamEvent(event)}
+	if event.Type == "turn_completed" {
+		if response := strings.TrimSpace(event.Response); response != "" {
+			events = append(events, StreamEvent{
+				Type:    "response",
+				Message: response,
+				Data: map[string]interface{}{
+					"source":                 "agent_runtime",
+					"runtimeEventType":       "turn_completed",
+					"runtimeTrace":           agentRuntimeTraceData(event),
+					"conversationId":         event.ConversationID,
+					"runtimeSessionId":       event.RuntimeSessionID,
+					"turnId":                 event.TurnID,
+					"runtimeEventId":         event.EventID,
+					"assistantMessageId":     event.AssistantMessageID,
+					"agentMode":              "agent_runtime",
+					"replay":                 true,
+					openai.SSEAccumulatedKey: response,
+				},
+			})
+		}
+		events = append(events, StreamEvent{
+			Type:    "done",
+			Message: "",
+			Data: map[string]interface{}{
+				"conversationId":     event.ConversationID,
+				"runtimeEventId":     event.EventID,
+				"runtimeEventType":   "turn_completed",
+				"assistantMessageId": event.AssistantMessageID,
+				"agentMode":          "agent_runtime",
+				"replay":             true,
+			},
+		})
+	}
+	lines := make([][]byte, 0, len(events))
+	for _, ev := range events {
+		b, err := json.Marshal(ev)
+		if err != nil {
+			continue
+		}
+		line := append([]byte("data: "), b...)
+		line = append(line, '\n', '\n')
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 // ListAgentTasks 列出所有运行中的任务
 func (h *AgentHandler) ListAgentTasks(c *gin.Context) {
+	tasks := h.tasks.GetActiveTasks()
+	if h != nil && h.config != nil && h.agentRuntimeConfig().Enabled && h.agentRuntimeConfig().TransportEffective() == "grpc" {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+		reader := h.agentRuntimeStateReader()
+		if reader != nil {
+			if states, err := reader.ListRunStates(ctx); err == nil {
+				tasks = mergeAgentRuntimeRunStates(tasks, states)
+			} else if h.logger != nil {
+				h.logger.Debug("列出 Agent Runtime 运行态失败", zap.Error(err))
+			}
+		}
+	}
 	c.JSON(http.StatusOK, gin.H{
-		"tasks": h.tasks.GetActiveTasks(),
+		"tasks": tasks,
 	})
+}
+
+func mergeAgentRuntimeRunStates(tasks []*AgentTask, states []agentruntime.RunState) []*AgentTask {
+	byConversation := make(map[string]*AgentTask, len(tasks)+len(states))
+	merged := make([]*AgentTask, 0, len(tasks)+len(states))
+	for _, task := range tasks {
+		if task == nil {
+			continue
+		}
+		clone := *task
+		merged = append(merged, &clone)
+		if strings.TrimSpace(task.ConversationID) != "" {
+			byConversation[task.ConversationID] = &clone
+		}
+	}
+	for _, state := range states {
+		cid := strings.TrimSpace(state.ConversationID)
+		if cid == "" {
+			continue
+		}
+		if task := byConversation[cid]; task != nil {
+			if task.Status == "" || task.Status == "running" || task.Status == "cancelling" {
+				task.Status = state.Status
+			}
+			if task.AgentMode == "" {
+				task.AgentMode = "agent_runtime"
+			}
+			if task.Message == "" {
+				task.Message = state.Message
+			}
+			if task.AssistantMessageID == "" {
+				task.AssistantMessageID = state.AssistantMessageID
+			}
+			continue
+		}
+		merged = append(merged, &AgentTask{
+			ConversationID:     cid,
+			Message:            state.Message,
+			StartedAt:          time.Now(),
+			Status:             state.Status,
+			AgentMode:          "agent_runtime",
+			AssistantMessageID: state.AssistantMessageID,
+		})
+	}
+	return merged
 }
 
 // ListCompletedTasks 列出最近完成的任务历史
@@ -2337,6 +2619,10 @@ func (h *AgentHandler) executeBatchQueue(queueID string) {
 				return
 			}
 			registered = true
+			if batchQueueWantsAgentRuntime(queue.AgentMode) {
+				h.tasks.SetTaskAgentMode(conversationID, "agent_runtime")
+				h.tasks.SetTaskAssistantMessageID(conversationID, assistantMessageID)
+			}
 			// 存储取消函数：暂停队列时取消子任务 context（与原先语义一致）
 			h.batchTaskManager.SetTaskCancel(queueID, timeoutCancel)
 

@@ -47,11 +47,16 @@ type Config struct {
 type AgentRuntimeConfig struct {
 	Enabled            bool   `yaml:"enabled" json:"enabled"`
 	BinaryPath         string `yaml:"binary_path,omitempty" json:"binary_path,omitempty"`
+	Transport          string `yaml:"transport,omitempty" json:"transport,omitempty"`
+	GRPCListen         string `yaml:"grpc_listen,omitempty" json:"grpc_listen,omitempty"`
+	RedisAddr          string `yaml:"redis_addr,omitempty" json:"redis_addr,omitempty"`
+	RedisPrefix        string `yaml:"redis_prefix,omitempty" json:"redis_prefix,omitempty"`
 	WorkspaceRoot      string `yaml:"workspace_root,omitempty" json:"workspace_root,omitempty"`
 	MaxSteps           int    `yaml:"max_steps,omitempty" json:"max_steps,omitempty"`
 	ToolTimeoutSeconds int    `yaml:"tool_timeout_seconds,omitempty" json:"tool_timeout_seconds,omitempty"`
 	MCPEnabled         bool   `yaml:"mcp_enabled,omitempty" json:"mcp_enabled,omitempty"`
 	SkillsEnabled      bool   `yaml:"skills_enabled,omitempty" json:"skills_enabled,omitempty"`
+	SkillsSource       string `yaml:"skills_source,omitempty" json:"skills_source,omitempty"`
 	KnowledgeEnabled   bool   `yaml:"knowledge_enabled,omitempty" json:"knowledge_enabled,omitempty"`
 	ApprovalEnabled    bool   `yaml:"approval_enabled,omitempty" json:"approval_enabled,omitempty"`
 	CompactionEnabled  bool   `yaml:"compaction_enabled,omitempty" json:"compaction_enabled,omitempty"`
@@ -73,6 +78,38 @@ func (c AgentRuntimeConfig) BinaryPathEffective(configDir string) string {
 		return filepath.Join(configDir, p)
 	}
 	return p
+}
+
+func (c AgentRuntimeConfig) TransportEffective() string {
+	switch strings.TrimSpace(strings.ToLower(c.Transport)) {
+	case "grpc":
+		return "grpc"
+	default:
+		return "jsonl"
+	}
+}
+
+func (c AgentRuntimeConfig) GRPCListenEffective() string {
+	if p := strings.TrimSpace(c.GRPCListen); p != "" {
+		return p
+	}
+	return "127.0.0.1:0"
+}
+
+func (c AgentRuntimeConfig) RedisPrefixEffective() string {
+	if p := strings.TrimSpace(c.RedisPrefix); p != "" {
+		return p
+	}
+	return "csai:agent_runtime:"
+}
+
+func (c AgentRuntimeConfig) SkillsSourceEffective() string {
+	switch strings.TrimSpace(strings.ToLower(c.SkillsSource)) {
+	case "go_context":
+		return "go_context"
+	default:
+		return "rust_dir"
+	}
 }
 
 func (c AgentRuntimeConfig) MaxStepsEffective() int {
@@ -114,11 +151,16 @@ func (c Config) AgentRuntimeEffective() AgentRuntimeConfig {
 func (c AgentRuntimeConfig) nonZero() bool {
 	return c.Enabled ||
 		strings.TrimSpace(c.BinaryPath) != "" ||
+		strings.TrimSpace(c.Transport) != "" ||
+		strings.TrimSpace(c.GRPCListen) != "" ||
+		strings.TrimSpace(c.RedisAddr) != "" ||
+		strings.TrimSpace(c.RedisPrefix) != "" ||
 		strings.TrimSpace(c.WorkspaceRoot) != "" ||
 		c.MaxSteps != 0 ||
 		c.ToolTimeoutSeconds != 0 ||
 		c.MCPEnabled ||
 		c.SkillsEnabled ||
+		strings.TrimSpace(c.SkillsSource) != "" ||
 		c.KnowledgeEnabled ||
 		c.ApprovalEnabled ||
 		c.CompactionEnabled ||

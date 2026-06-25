@@ -199,13 +199,26 @@ impl TurnLoop {
 
             let sampled_after_tool_result = self.tool_result_waiting_for_follow_up;
             let mut streamed_reasoning = String::new();
+            let mut streamed_content = String::new();
+            let stream_assistant_content =
+                sampled_after_tool_result && !self.plan.has_active_work();
             emit_event(
                 &mut events,
                 on_event,
                 self.runtime_status_update(progress_sampling_message(sampled_after_tool_result)),
             );
             let turn = match model.sample_with_deltas(&messages, |delta| match delta {
-                ModelDelta::Content(_) => {}
+                ModelDelta::Content(delta) => {
+                    if stream_assistant_content {
+                        streamed_content.push_str(&delta);
+                        final_response_streamed = true;
+                        emit_event(
+                            &mut events,
+                            on_event,
+                            self.assistant_delta(delta, &streamed_content),
+                        );
+                    }
+                }
                 ModelDelta::Reasoning(delta) => {
                     streamed_reasoning.push_str(&delta);
                     emit_event(&mut events, on_event, self.reasoning_delta(delta));
@@ -377,15 +390,8 @@ impl TurnLoop {
             }
 
             final_response = turn.content;
-            final_response_streamed = turn.streamed_content;
-            if final_response_streamed {
-                self.emit_assistant_text_stream(
-                    &final_response,
-                    &mut final_response_streamed,
-                    &mut events,
-                    on_event,
-                );
-            }
+            final_response_streamed =
+                final_response_streamed || (stream_assistant_content && turn.streamed_content);
             if completion_gate_allows_turn_completed(
                 &self.plan,
                 self.tool_result_waiting_for_follow_up,
@@ -586,13 +592,26 @@ impl TurnLoop {
             }
             let sampled_after_tool_result = self.tool_result_waiting_for_follow_up;
             let mut streamed_reasoning = String::new();
+            let mut streamed_content = String::new();
+            let stream_assistant_content =
+                sampled_after_tool_result && !self.plan.has_active_work();
             emit_event(
                 &mut events,
                 on_event,
                 self.runtime_status_update(progress_sampling_message(sampled_after_tool_result)),
             );
             let turn = match model.sample_with_deltas(&messages, |delta| match delta {
-                ModelDelta::Content(_) => {}
+                ModelDelta::Content(delta) => {
+                    if stream_assistant_content {
+                        streamed_content.push_str(&delta);
+                        final_response_streamed = true;
+                        emit_event(
+                            &mut events,
+                            on_event,
+                            self.assistant_delta(delta, &streamed_content),
+                        );
+                    }
+                }
                 ModelDelta::Reasoning(delta) => {
                     streamed_reasoning.push_str(&delta);
                     emit_event(&mut events, on_event, self.reasoning_delta(delta));
@@ -760,15 +779,8 @@ impl TurnLoop {
                 continue;
             }
             final_response = turn.content;
-            final_response_streamed = turn.streamed_content;
-            if final_response_streamed {
-                self.emit_assistant_text_stream(
-                    &final_response,
-                    &mut final_response_streamed,
-                    &mut events,
-                    on_event,
-                );
-            }
+            final_response_streamed =
+                final_response_streamed || (stream_assistant_content && turn.streamed_content);
             if completion_gate_allows_turn_completed(
                 &self.plan,
                 self.tool_result_waiting_for_follow_up,
@@ -1890,7 +1902,7 @@ mod tests {
 
         let first_delta = sink_events
             .iter()
-            .position(|event| matches!(event, RuntimeEvent::AssistantDelta { accumulated, .. } if accumulated == "hello stream"))
+            .position(|event| matches!(event, RuntimeEvent::AssistantDelta { accumulated, .. } if accumulated == "hello"))
             .unwrap();
         let completed = sink_events
             .iter()
@@ -1902,7 +1914,7 @@ mod tests {
                 .iter()
                 .filter(|event| matches!(event, RuntimeEvent::AssistantDelta { .. }))
                 .count(),
-            1
+            2
         );
         assert!(matches!(
             result.events.last(),

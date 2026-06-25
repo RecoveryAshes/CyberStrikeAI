@@ -1,23 +1,467 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"cyberstrike-ai/internal/agent"
 	"cyberstrike-ai/internal/agentruntime"
 	"cyberstrike-ai/internal/config"
 	"cyberstrike-ai/internal/database"
 	"cyberstrike-ai/internal/mcp"
+	"cyberstrike-ai/internal/openai"
 
+	"github.com/gin-gonic/gin"
 	_ "github.com/mattn/go-sqlite3"
 	"go.uber.org/zap"
 )
+
+type fakeRuntimeClient struct {
+	interruptConversationID string
+	interruptReason         string
+	interruptContinueAfter  bool
+}
+
+func (f *fakeRuntimeClient) StartTurn(context.Context, agentruntime.Command, func(agentruntime.Event) error) error {
+	return nil
+}
+
+func (f *fakeRuntimeClient) InterruptTurn(_ context.Context, conversationID, reason string, continueAfter bool) error {
+	f.interruptConversationID = conversationID
+	f.interruptReason = reason
+	f.interruptContinueAfter = continueAfter
+	return nil
+}
+
+func (f *fakeRuntimeClient) ResumeApproval(context.Context, agentruntime.Command, func(agentruntime.Event) error) error {
+	return nil
+}
+
+func (f *fakeRuntimeClient) IsStarted() bool {
+	return true
+}
+
+func (f *fakeRuntimeClient) Close() error {
+	return nil
+}
+
+type fakeRuntimeStateReader struct {
+	listEventsConversationID string
+	listEventsAfterEventID   string
+	listEventsLimit          int
+	listEvents               []agentruntime.Event
+	listEventsCalls          int
+	getRunState              agentruntime.RunState
+	getRunStateFound         bool
+	listRunStates            []agentruntime.RunState
+}
+
+func (f *fakeRuntimeStateReader) GetRunState(_ context.Context, conversationID string) (agentruntime.RunState, bool, error) {
+	if f.getRunStateFound {
+		f.getRunState.ConversationID = conversationID
+		return f.getRunState, true, nil
+	}
+	for _, state := range f.listRunStates {
+		if state.ConversationID == conversationID {
+			return state, true, nil
+		}
+	}
+	return agentruntime.RunState{}, false, nil
+}
+
+func (f *fakeRuntimeStateReader) ListRunStates(context.Context) ([]agentruntime.RunState, error) {
+	return f.listRunStates, nil
+}
+
+func (f *fakeRuntimeStateReader) ListEvents(_ context.Context, conversationID, afterEventID string, limit int) ([]agentruntime.Event, error) {
+	f.listEventsConversationID = conversationID
+	f.listEventsAfterEventID = afterEventID
+	f.listEventsLimit = limit
+	f.listEventsCalls++
+	return f.listEvents, nil
+}
+
+func TestCancelAgentRuntimeContinueAfterIsRejected(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tasks := NewAgentTaskManager()
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	if _, err := tasks.StartTask("conv-runtime", "running", cancel); err != nil {
+		t.Fatalf("StartTask: %v", err)
+	}
+	tasks.SetTaskAgentMode("conv-runtime", "agent_runtime")
+	h := &AgentHandler{tasks: tasks, logger: zap.NewNop()}
+	body := bytes.NewBufferString(`{"conversationId":"conv-runtime","continueAfter":true,"reason":"more context"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/agent-loop/cancel", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+
+	h.CancelAgentLoop(c)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("agent runtime continueAfter rejection should not cancel task: %v", ctx.Err())
+	}
+	if !strings.Contains(w.Body.String(), "unsupported_continue_after") {
+		t.Fatalf("response body = %s", w.Body.String())
+	}
+}
+
+func TestMergeAgentRuntimeRunStates(t *testing.T) {
+	started := time.Now()
+	tasks := []*AgentTask{{
+		ConversationID: "conv-1",
+		Message:        "local",
+		StartedAt:      started,
+		Status:         "running",
+	}}
+	states := []agentruntime.RunState{
+		{ConversationID: "conv-1", Status: "awaiting_approval", Message: "approval", AssistantMessageID: "assistant-1"},
+		{ConversationID: "conv-2", Status: "running", Message: "remote", AssistantMessageID: "assistant-2"},
+	}
+
+	merged := mergeAgentRuntimeRunStates(tasks, states)
+
+	if len(merged) != 2 {
+		t.Fatalf("merged len = %d, want 2: %#v", len(merged), merged)
+	}
+	if merged[0].ConversationID != "conv-1" || merged[0].Status != "awaiting_approval" || merged[0].AgentMode != "agent_runtime" || merged[0].AssistantMessageID != "assistant-1" {
+		t.Fatalf("merged existing task = %#v", merged[0])
+	}
+	if merged[1].ConversationID != "conv-2" || merged[1].Status != "running" || merged[1].AgentMode != "agent_runtime" || merged[1].AssistantMessageID != "assistant-2" {
+		t.Fatalf("merged runtime task = %#v", merged[1])
+	}
+}
+
+func TestAgentRuntimeReplayMapsEventsWithoutSideEffects(t *testing.T) {
+	h := &AgentHandler{}
+	line, ok := h.agentRuntimeReplayEventLine(agentruntime.Event{
+		Type:             "approval_requested",
+		EventID:          "1740000000000-0",
+		ConversationID:   "conv-1",
+		RuntimeSessionID: "session-1",
+		TurnID:           "turn-1",
+		RequestID:        "approval-1",
+		Permission:       "mcp_call",
+		ToolCallID:       "call-1",
+		ToolName:         "mcp_call",
+		Message:          "approve tool",
+	})
+	if !ok {
+		t.Fatalf("expected replay line")
+	}
+	var envelope StreamEvent
+	raw := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(string(line)), "data:"))
+	if err := json.Unmarshal([]byte(raw), &envelope); err != nil {
+		t.Fatalf("decode replay line: %v", err)
+	}
+	if envelope.Type != "hitl_approval_requested" || envelope.Message != "approve tool" {
+		t.Fatalf("envelope = %#v", envelope)
+	}
+	data, ok := envelope.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("data = %#v", envelope.Data)
+	}
+	if data["replay"] != true || data["runtimeEventId"] != "1740000000000-0" || data["agentMode"] != "agent_runtime" {
+		t.Fatalf("data = %#v", data)
+	}
+	if data["interruptId"] != nil {
+		t.Fatalf("replay must not synthesize HITL interrupt id: %#v", data)
+	}
+}
+
+func TestAgentRuntimeReplayAssistantDeltaUsesAccumulatedFromEvent(t *testing.T) {
+	h := &AgentHandler{}
+	ev := h.agentRuntimeReplayStreamEvent(agentruntime.Event{
+		Type:             "assistant_delta",
+		ConversationID:   "conv-1",
+		RuntimeSessionID: "session-1",
+		TurnID:           "turn-1",
+		Delta:            "lo",
+		Accumulated:      "hello",
+	})
+	if ev.Type != "response_delta" || ev.Message != "lo" {
+		t.Fatalf("stream event = %#v", ev)
+	}
+	data, ok := ev.Data.(map[string]interface{})
+	if !ok {
+		t.Fatalf("data = %#v", ev.Data)
+	}
+	if data[openai.SSEAccumulatedKey] != "hello" {
+		t.Fatalf("accumulated = %#v", data[openai.SSEAccumulatedKey])
+	}
+}
+
+func TestAgentRuntimeReplayTurnCompletedIncludesResponseAndDone(t *testing.T) {
+	h := &AgentHandler{}
+	lines := h.agentRuntimeReplayEventLines(agentruntime.Event{
+		Type:               "turn_completed",
+		EventID:            "5-0",
+		ConversationID:     "conv-1",
+		RuntimeSessionID:   "session-1",
+		TurnID:             "turn-1",
+		Response:           "final answer",
+		AssistantMessageID: "assistant-1",
+	})
+	if len(lines) != 3 {
+		t.Fatalf("lines len = %d, want 3: %#v", len(lines), lines)
+	}
+	body := string(bytes.Join(lines, nil))
+	if !strings.Contains(body, `"type":"response"`) || !strings.Contains(body, `"message":"final answer"`) {
+		t.Fatalf("replay response missing: %s", body)
+	}
+	if !strings.Contains(body, `"type":"done"`) {
+		t.Fatalf("replay done missing: %s", body)
+	}
+	if !strings.Contains(body, `"assistantMessageId":"assistant-1"`) {
+		t.Fatalf("assistant message id missing: %s", body)
+	}
+}
+
+func TestSubscribeAgentTaskEventsUsesReplayCursor(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	reader := &fakeRuntimeStateReader{
+		getRunStateFound: true,
+		getRunState: agentruntime.RunState{
+			Status:             "completed",
+			AssistantMessageID: "assistant-1",
+		},
+		listEvents: []agentruntime.Event{{
+			Type:           "assistant_delta",
+			EventID:        "2-0",
+			ConversationID: "conv-1",
+			Delta:          "i",
+			Accumulated:    "hi",
+		}},
+	}
+	h := &AgentHandler{
+		config: &config.Config{
+			AgentRuntime: config.AgentRuntimeConfig{Enabled: true, Transport: "grpc", RedisAddr: "127.0.0.1:6379"},
+		},
+		tasks:                         NewAgentTaskManager(),
+		taskEventBus:                  NewTaskEventBus(),
+		agentRuntimeStateReaderCached: reader,
+		agentRuntimeStateRedisAddr:    "127.0.0.1:6379",
+		agentRuntimeStateRedisPrefix:  "csai:agent_runtime:",
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/agent-loop/task-events?conversationId=conv-1&afterEventId=1-0&limit=7", nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+
+	h.SubscribeAgentTaskEvents(c)
+
+	if reader.listEventsConversationID != "conv-1" || reader.listEventsAfterEventID != "1-0" || reader.listEventsLimit != 7 {
+		t.Fatalf("ListEvents args = conversation %q after %q limit %d", reader.listEventsConversationID, reader.listEventsAfterEventID, reader.listEventsLimit)
+	}
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"runtimeEventId":"2-0"`) {
+		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"assistantMessageId":"assistant-1"`) {
+		t.Fatalf("assistant message id from conversation state missing: %s", w.Body.String())
+	}
+}
+
+func TestAgentRuntimeTaskEventBridgeFlushesTerminalAfterLegacyClose(t *testing.T) {
+	reader := &fakeRuntimeStateReader{
+		listRunStates: []agentruntime.RunState{{
+			ConversationID:     "conv-terminal",
+			Status:             "running",
+			AssistantMessageID: "assistant-terminal",
+		}},
+		listEvents: []agentruntime.Event{{
+			Type:               "turn_completed",
+			EventID:            "9-0",
+			ConversationID:     "conv-terminal",
+			RuntimeSessionID:   "session-1",
+			TurnID:             "turn-1",
+			Response:           "done from redis",
+			AssistantMessageID: "assistant-terminal",
+		}},
+	}
+	h := &AgentHandler{
+		config: &config.Config{
+			AgentRuntime: config.AgentRuntimeConfig{Enabled: true, Transport: "grpc", RedisAddr: "127.0.0.1:6379"},
+		},
+		tasks:                         NewAgentTaskManager(),
+		taskEventBus:                  NewTaskEventBus(),
+		agentRuntimeStateReaderCached: reader,
+		agentRuntimeStateRedisAddr:    "127.0.0.1:6379",
+		agentRuntimeStateRedisPrefix:  "csai:agent_runtime:",
+	}
+	bridge := h.newAgentRuntimeTaskEventBridge("", "", 100)
+	legacy := make(chan []byte)
+	close(legacy)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var lines []string
+	bridge.Stream(ctx, legacy, func(line []byte) bool {
+		lines = append(lines, string(line))
+		return true
+	})
+	body := strings.Join(lines, "")
+	if !strings.Contains(body, `"type":"response"`) || !strings.Contains(body, "done from redis") {
+		t.Fatalf("terminal response not flushed after legacy close: %s", body)
+	}
+	if !strings.Contains(body, `"type":"done"`) {
+		t.Fatalf("terminal done not flushed after legacy close: %s", body)
+	}
+}
+
+func TestSubscribeAgentTaskEventsGlobalStreamsRuntimeEventsFromBridge(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	reader := &fakeRuntimeStateReader{
+		listRunStates: []agentruntime.RunState{{
+			ConversationID:     "conv-live",
+			Status:             "running",
+			Message:            "running",
+			AssistantMessageID: "assistant-live",
+		}},
+		listEvents: []agentruntime.Event{{
+			Type:             "assistant_progress_update",
+			EventID:          "3-0",
+			ConversationID:   "conv-live",
+			RuntimeSessionID: "session-1",
+			TurnID:           "turn-1",
+			Message:          "正在打开官方文档。",
+		}},
+	}
+	tasks := NewAgentTaskManager()
+	_, err := tasks.StartTask("conv-live", "查询快代理官方文档，给我私密代理的参数和api", func(error) {})
+	if err != nil {
+		t.Fatalf("StartTask: %v", err)
+	}
+	tasks.SetTaskAgentMode("conv-live", "agent_runtime")
+	h := &AgentHandler{
+		config: &config.Config{
+			AgentRuntime: config.AgentRuntimeConfig{Enabled: true, Transport: "grpc", RedisAddr: "127.0.0.1:6379"},
+		},
+		tasks:                         tasks,
+		taskEventBus:                  NewTaskEventBus(),
+		agentRuntimeStateReaderCached: reader,
+		agentRuntimeStateRedisAddr:    "127.0.0.1:6379",
+		agentRuntimeStateRedisPrefix:  "csai:agent_runtime:",
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/agent-loop/task-events", nil).WithContext(ctx)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = req
+
+	h.SubscribeAgentTaskEvents(c)
+
+	body := w.Body.String()
+	if !strings.Contains(body, `"runtimeEventId":"3-0"`) {
+		t.Fatalf("global task-events did not stream runtime event from bridge; calls=%d body=%s", reader.listEventsCalls, body)
+	}
+	if !strings.Contains(body, `"runtimeEventType":"assistant_progress_update"`) {
+		t.Fatalf("runtime event did not preserve frontend envelope contract: %s", body)
+	}
+	if !strings.Contains(body, `"conversationId":"conv-live"`) {
+		t.Fatalf("runtime event did not preserve conversation id for global EventSource: %s", body)
+	}
+	if !strings.Contains(body, `"assistantMessageId":"assistant-live"`) {
+		t.Fatalf("runtime event did not attach assistant message id from runtime state: %s", body)
+	}
+	if reader.listEventsConversationID != "conv-live" {
+		t.Fatalf("ListEvents conversation = %q, want conv-live", reader.listEventsConversationID)
+	}
+	if reader.listEventsCalls == 0 {
+		t.Fatal("expected ListEvents to be called")
+	}
+}
+
+func TestAgentRuntimeTaskEventBridgeUsesRunStatesWithoutGoTask(t *testing.T) {
+	reader := &fakeRuntimeStateReader{
+		listRunStates: []agentruntime.RunState{{
+			ConversationID:     "conv-redis",
+			Status:             "running",
+			Message:            "running from redis",
+			AssistantMessageID: "assistant-redis",
+		}},
+		listEvents: []agentruntime.Event{{
+			Type:           "tool_call_started",
+			EventID:        "4-0",
+			ConversationID: "conv-redis",
+			TurnID:         "turn-1",
+			ToolCallID:     "call-1",
+			ToolName:       "web_search",
+		}},
+	}
+	h := &AgentHandler{
+		config: &config.Config{
+			AgentRuntime: config.AgentRuntimeConfig{Enabled: true, Transport: "grpc", RedisAddr: "127.0.0.1:6379"},
+		},
+		tasks:                         NewAgentTaskManager(),
+		agentRuntimeStateReaderCached: reader,
+		agentRuntimeStateRedisAddr:    "127.0.0.1:6379",
+		agentRuntimeStateRedisPrefix:  "csai:agent_runtime:",
+	}
+	bridge := h.newAgentRuntimeTaskEventBridge("", "", 100)
+
+	var lines []string
+	ok := bridge.flushRuntimeEvents(context.Background(), func(line []byte) bool {
+		lines = append(lines, string(line))
+		return true
+	})
+
+	if !ok {
+		t.Fatal("flushRuntimeEvents returned false")
+	}
+	if len(lines) != 1 {
+		t.Fatalf("lines len = %d, want 1: %#v", len(lines), lines)
+	}
+	line := lines[0]
+	if !strings.Contains(line, `"conversationId":"conv-redis"`) || !strings.Contains(line, `"runtimeEventId":"4-0"`) {
+		t.Fatalf("line does not contain bridged runtime identity: %s", line)
+	}
+	if !strings.Contains(line, `"assistantMessageId":"assistant-redis"`) {
+		t.Fatalf("line does not contain assistant message id from runtime state: %s", line)
+	}
+	if !strings.Contains(line, `"runtimeEventType":"tool_call_started"`) {
+		t.Fatalf("line does not preserve runtime event type: %s", line)
+	}
+	if reader.listEventsConversationID != "conv-redis" {
+		t.Fatalf("ListEvents conversation = %q, want conv-redis", reader.listEventsConversationID)
+	}
+}
+
+func TestInterruptAgentRuntimeRunDoesNotRequireListStatePreflight(t *testing.T) {
+	client := &fakeRuntimeClient{}
+	h := &AgentHandler{
+		config: &config.Config{
+			AgentRuntime: config.AgentRuntimeConfig{Enabled: true, Transport: "grpc"},
+		},
+		agentRuntimeClientCached: client,
+	}
+
+	ok := h.interruptAgentRuntimeRunFromHTTP(context.Background(), "conv-1", "stop", false)
+
+	if !ok {
+		t.Fatal("expected interrupt to be attempted without run-state preflight")
+	}
+	if client.interruptConversationID != "conv-1" || client.interruptReason != "stop" || client.interruptContinueAfter {
+		t.Fatalf("interrupt args = conversation %q reason %q continue %v", client.interruptConversationID, client.interruptReason, client.interruptContinueAfter)
+	}
+}
 
 func TestHandleAgentRuntimeEventCompletionGate(t *testing.T) {
 	h := &AgentHandler{}
@@ -786,7 +1230,43 @@ func TestHandleAgentRuntimeApprovalRequestedDoesNotComplete(t *testing.T) {
 	}
 }
 
-func TestAgentRuntimeSkillsIncludeProgressivePackageData(t *testing.T) {
+func TestAgentRuntimeContextPassesSkillsDirWithoutFullContentByDefault(t *testing.T) {
+	root := t.TempDir()
+	skillDir := filepath.Join(root, "demo")
+	if err := os.MkdirAll(filepath.Join(skillDir, "references"), 0755); err != nil {
+		t.Fatalf("mkdir skill: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(skillDir, "SKILL.md"), []byte("---\nname: demo\ndescription: Demo skill\n---\nUse references/guide.md when needed.\n"), 0644); err != nil {
+		t.Fatalf("write SKILL.md: %v", err)
+	}
+	h := &AgentHandler{
+		config:     &config.Config{AgentRuntime: config.AgentRuntimeConfig{SkillsEnabled: true}, SkillsDir: root},
+		configPath: filepath.Join(root, "config.yaml"),
+	}
+
+	ctx := h.agentRuntimeContext("conv-1", ChatRequest{Message: "x"}, []string{"read_file", "skill:demo", "skill::other"})
+	if ctx["skills_enabled"] != true {
+		t.Fatalf("skills_enabled = %#v", ctx["skills_enabled"])
+	}
+	if ctx["skills_source"] != "rust_dir" {
+		t.Fatalf("skills_source = %#v, want rust_dir", ctx["skills_source"])
+	}
+	if ctx["skills_dir"] != root {
+		t.Fatalf("skills_dir = %#v, want %q", ctx["skills_dir"], root)
+	}
+	if _, ok := ctx["skills"]; ok {
+		t.Fatalf("default runtime context should not include full skills content: %#v", ctx["skills"])
+	}
+	allowlist, ok := ctx["skills_allowlist"].([]string)
+	if !ok {
+		t.Fatalf("skills_allowlist type = %#v", ctx["skills_allowlist"])
+	}
+	if len(allowlist) != 2 || allowlist[0] != "demo" || allowlist[1] != "other" {
+		t.Fatalf("skills_allowlist = %#v, want demo/other", allowlist)
+	}
+}
+
+func TestAgentRuntimeSkillsSourceGoContextIncludesProgressivePackageData(t *testing.T) {
 	root := t.TempDir()
 	skillDir := filepath.Join(root, "demo")
 	if err := os.MkdirAll(filepath.Join(skillDir, "references"), 0755); err != nil {
@@ -799,11 +1279,18 @@ func TestAgentRuntimeSkillsIncludeProgressivePackageData(t *testing.T) {
 		t.Fatalf("write reference: %v", err)
 	}
 	h := &AgentHandler{
-		config:     &config.Config{AgentRuntime: config.AgentRuntimeConfig{SkillsEnabled: true}, SkillsDir: root},
+		config:     &config.Config{AgentRuntime: config.AgentRuntimeConfig{SkillsEnabled: true, SkillsSource: "go_context"}, SkillsDir: root},
 		configPath: filepath.Join(root, "config.yaml"),
 	}
 
-	skills := h.agentRuntimeSkills()
+	ctx := h.agentRuntimeContext("conv-1", ChatRequest{Message: "x"}, nil)
+	if ctx["skills_source"] != "go_context" {
+		t.Fatalf("skills_source = %#v, want go_context", ctx["skills_source"])
+	}
+	skills, ok := ctx["skills"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("skills missing or wrong type: %#v", ctx["skills"])
+	}
 	raw, ok := skills["demo"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("skill package missing or wrong type: %#v", skills["demo"])
