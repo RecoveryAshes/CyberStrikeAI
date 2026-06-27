@@ -155,6 +155,13 @@ export function adaptSSE(envelope: SSEEnvelope): RuntimeAction[] {
     }
     case "runtime_status_update":
       break;
+    case "task_updated":
+    case "task_completed":
+    case "task_removed":
+      break;
+    case "hitl_pending_updated":
+    case "hitl_decision_updated":
+      break;
     case "reasoning_delta":
     case "reasoning_chain_stream_delta":
     case "thinking_stream_delta":
@@ -169,6 +176,20 @@ export function adaptSSE(envelope: SSEEnvelope): RuntimeAction[] {
       actions.push({
         type: "plan",
         items: normalizePlanItems(trace?.items || trace?.plan || envelope.data?.items || envelope.data?.plan || envelope.message)
+      });
+      break;
+    case "todo_updated":
+      actions.push({
+        type: "plan",
+        conversationId: firstText(envelope.data?.conversationId, trace?.conversationId),
+        items: normalizePlanItems(envelope.data?.todos || envelope.data?.items || trace?.todos || trace?.items, "todo")
+      });
+      break;
+    case "todo_cleared":
+      actions.push({
+        type: "plan",
+        conversationId: firstText(envelope.data?.conversationId, trace?.conversationId),
+        items: []
       });
       break;
     case "tool_call_started":
@@ -218,8 +239,11 @@ export function adaptSSE(envelope: SSEEnvelope): RuntimeAction[] {
     case "turn_completed":
     case "done":
     case "response":
-      if (type === "response" && envelope.message) {
-        actions.push({ type: "assistant_delta", delta: "", accumulated: String(envelope.message) });
+      {
+        const finalResponse = compactText(trace?.response || envelope.data?.response || envelope.message, "");
+        if (finalResponse) {
+          actions.push({ type: "assistant_delta", delta: "", accumulated: finalResponse });
+        }
       }
       actions.push({ type: "finish", status: "completed" });
       break;

@@ -198,6 +198,33 @@ export function runtimeReducer(state: RuntimeState, action: RuntimeAction): Runt
         ].slice(-100)
       }));
     case "plan":
+      if (action.conversationId && !action.runId) {
+        const existingRun = state.runs.find((run) => run.conversationId === action.conversationId);
+        if (existingRun) {
+          return updateRun(state, existingRun.id, (run) => ({
+            ...run,
+            plan: action.items,
+            status: action.status || run.status
+          }));
+        }
+        if (action.items.length === 0) return state;
+        const run: TurnRun = {
+          id: taskRunId(action.conversationId),
+          origin: "task",
+          conversationId: action.conversationId,
+          assistantText: "",
+          reasoningText: "",
+          progressUpdates: [],
+          status: action.status || "completed",
+          plan: action.items,
+          tools: {},
+          approvals: [],
+          events: [],
+          startedAt: new Date().toISOString(),
+          completedAt: action.status === "running" || action.status === "awaiting_approval" ? undefined : new Date().toISOString()
+        };
+        return { ...state, activeRun: state.activeRun, runs: sortRuns([run, ...state.runs]).slice(0, MAX_TRACKED_RUNS) };
+      }
       return updateRun(state, action.runId, (run) => ({ ...run, plan: action.items }));
     case "tool":
       return updateRun(state, action.runId, (run) => ({ ...run, tools: mergeTool(run.tools, action.tool) }));

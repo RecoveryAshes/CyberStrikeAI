@@ -27,7 +27,7 @@ import {
 import DOMPurify from "dompurify";
 import { marked } from "marked";
 import { Api } from "../../api/resources";
-import type { AgentTask, AppConfig, ChatRequest, ConversationMessage, HITLConfig, ProcessDetail, SSEEnvelope } from "../../api/types";
+import type { AgentTask, AppConfig, ChatRequest, ConversationMessage, HITLConfig, HITLPendingItem, ProcessDetail, RuntimeTodoItem, SSEEnvelope } from "../../api/types";
 import { ApiError, apiStream, getAuthToken } from "../../api/client";
 import { adaptSSE, parseSSELine, processDetailsToEvents } from "../../runtime/eventAdapter";
 import { initialRuntimeState, runtimeReducer } from "../../runtime/reducer";
@@ -104,6 +104,8 @@ const EMPTY_MESSAGES: never[] = [];
 const EMPTY_ROLES: never[] = [];
 const EMPTY_PROJECTS: never[] = [];
 const EMPTY_TASKS: never[] = [];
+const EMPTY_RUNTIME_TODOS: RuntimeTodoItem[] = [];
+const RECENT_COMPLETED_RUN_REUSE_MS = 60_000;
 
 function updateOpenAIModel(config: AppConfig | undefined, model: string): AppConfig {
   return {
@@ -277,11 +279,59 @@ function isTerminalRunEnvelope(envelope: SSEEnvelope) {
   return type === "done" || type === "response" || type === "turn_completed" || type === "turn_aborted" || type === "cancelled" || type === "error" || type === "runtime_error";
 }
 
+function runtimeTodoItemsFromUnknown(raw: unknown): RuntimeTodoItem[] {
+  return Array.isArray(raw) ? raw.filter((item): item is RuntimeTodoItem => Boolean(item && typeof item === "object")) : [];
+}
+
+function planItemsFromRuntimeTodos(todos: RuntimeTodoItem[]): PlanItem[] {
+  return todos
+    .slice()
+    .sort((a, b) => (Number(a.position ?? 0) - Number(b.position ?? 0)))
+    .map((todo, index) => ({
+      id: String(todo.itemId || todo.item_id || todo.id || `todo-${index}`),
+      content: String(todo.content || `Step ${index + 1}`),
+      status: normalizePlanItems([{ status: todo.status, content: todo.content, id: todo.itemId || todo.item_id || todo.id }], "todo")[0]?.status || "pending"
+    }));
+}
+
+function taskFromEnvelope(envelope: SSEEnvelope): AgentTask | null {
+  const data = envelope.data || {};
+  const task = data.task && typeof data.task === "object" ? (data.task as AgentTask) : null;
+  const conversationId = firstNonObjectText(task?.conversationId, data.conversationId);
+  if (!conversationId) return null;
+  return { ...(task || {}), conversationId };
+}
+
+function taskIsActive(task: AgentTask) {
+  const active = task.active;
+  if (typeof active === "boolean") return active;
+  const status = String(task.status || "").toLowerCase();
+  return !["completed", "cancelled", "canceled", "failed", "error"].includes(status);
+}
+
 function runningRunForConversation(runs: TurnRun[], conversationId?: string) {
   if (!conversationId) return null;
   return runs.find(
     (run) => run.conversationId === conversationId && (run.status === "running" || run.status === "awaiting_approval")
   ) || null;
+}
+
+export function recentCompletedRunForConversation(runs: TurnRun[], conversationId?: string) {
+  if (!conversationId) return null;
+  const run = runs.find((item) => item.conversationId === conversationId && item.status === "completed" && item.completedAt);
+  if (!run?.completedAt) return null;
+  const completedAt = Date.parse(run.completedAt);
+  if (Number.isNaN(completedAt)) return null;
+  const age = Date.now() - completedAt;
+  return age >= 0 && age <= RECENT_COMPLETED_RUN_REUSE_MS ? run : null;
+}
+
+export function displayRunForConversation(runs: TurnRun[], conversationId?: string) {
+  if (!conversationId) return null;
+  return runningRunForConversation(runs, conversationId) ||
+    runs.find((run) => run.conversationId === conversationId && run.assistantText.trim()) ||
+    runs.find((run) => run.conversationId === conversationId) ||
+    null;
 }
 
 function taskStartedAt(task: AgentTask) {
@@ -448,11 +498,27 @@ export function ChatWorkbench() {
   const abortControllersRef = useRef<Record<string, AbortController>>({});
   const handedOffRunIdsRef = useRef<Set<string>>(new Set());
   const conversationIdRef = useRef<string | undefined>(conversationId);
+  const lastSseFallbackRef = useRef(0);
+  const sseInvalidationTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const [runtime, runtimeDispatch] = useReducer(runtimeReducer, initialRuntimeState);
   const runtimeRef = useRef(runtime);
   const dispatch = useCallback((action: RuntimeAction) => {
     runtimeRef.current = runtimeReducer(runtimeRef.current, action);
     runtimeDispatch(action);
+  }, []);
+  const scheduleSseInvalidation = useCallback((slot: string, queryKey: readonly unknown[], delayMs = 1_500) => {
+    if (sseInvalidationTimersRef.current[slot]) return;
+    sseInvalidationTimersRef.current[slot] = setTimeout(() => {
+      delete sseInvalidationTimersRef.current[slot];
+      queryClient.invalidateQueries({ queryKey }).catch(() => undefined);
+    }, delayMs);
+  }, [queryClient]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(sseInvalidationTimersRef.current).forEach((timer) => clearTimeout(timer));
+      sseInvalidationTimersRef.current = {};
+    };
   }, []);
 
   useEffect(() => {
@@ -473,9 +539,7 @@ export function ChatWorkbench() {
   const projects = data.projects.data?.projects || EMPTY_PROJECTS;
   const activeTasks = data.tasks.data?.tasks || EMPTY_TASKS;
   const activeConversationRun = useMemo(() => {
-    return runningRunForConversation(runtime.runs, conversationId) ||
-      [...runtime.runs].find((run) => run.conversationId === conversationId) ||
-      null;
+    return displayRunForConversation(runtime.runs, conversationId);
   }, [conversationId, runtime.runs]);
   const activeConversationIsRunning = activeConversationRun?.status === "running" || activeConversationRun?.status === "awaiting_approval";
   const restoredEvents = useMemo(() => processDetailsToEvents(runtime.processDetails), [runtime.processDetails]);
@@ -507,6 +571,24 @@ export function ChatWorkbench() {
   }, [conversationId]);
 
   useEffect(() => {
+    if (!conversationId || data.runtimeTodos.isLoading || !data.runtimeTodos.data) return;
+    const plan = planItemsFromRuntimeTodos(data.runtimeTodos.data.todos || EMPTY_RUNTIME_TODOS);
+    dispatch({ type: "plan", conversationId, items: plan, status: activeConversationIsRunning ? "running" : "completed" });
+  }, [activeConversationIsRunning, conversationId, data.runtimeTodos.data, data.runtimeTodos.isLoading]);
+
+  useEffect(() => {
+    if (!conversationId || !data.pending.data?.items?.length) return;
+    let run = runningRunForConversation(runtimeRef.current.runs, conversationId) || runtimeRef.current.runs.find((item) => item.conversationId === conversationId);
+    if (!run) {
+      dispatch({ type: "ensure_run", conversationId, origin: "task" });
+      run = runningRunForConversation(runtimeRef.current.runs, conversationId) || runtimeRef.current.runs.find((item) => item.conversationId === conversationId);
+    }
+    for (const item of data.pending.data.items) {
+      dispatch({ type: "approval", approval: item, runId: run?.id });
+    }
+  }, [conversationId, data.pending.data]);
+
+  useEffect(() => {
     const activeConversationIds = new Set(
       activeTasks
         .map((task) => (typeof task.conversationId === "string" ? task.conversationId.trim() : ""))
@@ -523,13 +605,13 @@ export function ChatWorkbench() {
     dispatch({ type: "hydrate_tasks", tasks: activeTasks });
     for (const run of completedTaskRuns) {
       if (run.conversationId) {
-        queryClient.invalidateQueries({ queryKey: ["conversation", run.conversationId] }).catch(() => undefined);
+        scheduleSseInvalidation(`conversation:${run.conversationId}`, ["conversation", run.conversationId]);
       }
     }
     if (completedTaskRuns.length > 0) {
-      queryClient.invalidateQueries({ queryKey: ["conversations"] }).catch(() => undefined);
+      scheduleSseInvalidation("conversations", ["conversations"]);
     }
-  }, [activeTasks, queryClient]);
+  }, [activeTasks, scheduleSseInvalidation]);
 
   useEffect(() => {
     if (!conversationId && conversations[0]?.id) setConversationId(conversations[0].id);
@@ -586,12 +668,79 @@ export function ChatWorkbench() {
       if (!parsed) return;
       const cid = conversationIdFromEnvelope(parsed);
       if (!cid) return;
-      if (parsed.type === "conversation_title_updated") {
-        queryClient.invalidateQueries({ queryKey: ["conversation", cid] }).catch(() => undefined);
-        queryClient.invalidateQueries({ queryKey: ["conversations"] }).catch(() => undefined);
+      const type = String(parsed.type || "");
+      if (type === "task_updated" || type === "task_completed" || type === "task_removed") {
+        const task = taskFromEnvelope(parsed);
+        if (task) {
+          const active = taskIsActive(task) && type === "task_updated";
+          const currentTasks = queryClient.getQueryData<{ tasks: AgentTask[] }>(["tasks"])?.tasks || runtimeRef.current.activeTasks || [];
+          const nextTasks = active
+            ? [...currentTasks.filter((item) => item.conversationId !== task.conversationId), task]
+            : currentTasks.filter((item) => item.conversationId !== task.conversationId);
+          queryClient.setQueryData(["tasks"], { tasks: nextTasks });
+          dispatch({ type: "tasks", tasks: nextTasks });
+          if (active) {
+            dispatch({
+              type: "ensure_run",
+              conversationId: cid,
+              message: task.message,
+              startedAt: taskStartedAt(task),
+              origin: "task"
+            });
+          } else {
+            const run = runningRunForConversation(runtimeRef.current.runs, cid) || runtimeRef.current.runs.find((item) => item.conversationId === cid);
+            dispatch({
+              type: "finish",
+              status: type === "task_removed" || task.status === "cancelled" || task.status === "canceled" ? "cancelled" : task.status === "failed" || task.status === "error" ? "error" : "completed",
+              runId: run?.id
+            });
+          }
+        }
+        if (!task || !taskIsActive(task) || type !== "task_updated") {
+          if (cid === conversationIdRef.current) {
+            scheduleSseInvalidation(`conversation:${cid}`, ["conversation", cid]);
+          }
+          scheduleSseInvalidation("conversations", ["conversations"]);
+        }
         return;
       }
-      let scopedRun = runningRunForConversation(runtimeRef.current.runs, cid);
+      if (type === "hitl_pending_updated" || type === "hitl_decision_updated") {
+        const items = Array.isArray(parsed.data?.items) ? parsed.data.items as HITLPendingItem[] : [];
+        queryClient.setQueryData(["hitl-pending", cid], { items });
+        if (cid === conversationIdRef.current) {
+          let run = runningRunForConversation(runtimeRef.current.runs, cid) || runtimeRef.current.runs.find((item) => item.conversationId === cid);
+          if (!run && items.length > 0) {
+            dispatch({ type: "ensure_run", conversationId: cid, origin: "task" });
+            run = runningRunForConversation(runtimeRef.current.runs, cid) || runtimeRef.current.runs.find((item) => item.conversationId === cid);
+          }
+          for (const item of items) dispatch({ type: "approval", approval: item, runId: run?.id });
+          if (items.length === 0) {
+            const run = runningRunForConversation(runtimeRef.current.runs, cid);
+            if (run?.status === "awaiting_approval") dispatch({ type: "event", runId: run.id, event: { id: `hitl-${Date.now()}`, type, label: type, time: new Date().toISOString(), raw: parsed }, patch: { status: "running" } });
+          }
+        }
+        return;
+      }
+      if (type === "todo_updated" || type === "todo_cleared") {
+        const todos = type === "todo_cleared" ? [] : runtimeTodoItemsFromUnknown(parsed.data?.todos || parsed.data?.items);
+        queryClient.setQueryData(["runtime-todos", cid], { conversationId: cid, todos });
+        dispatch({
+          type: "plan",
+          conversationId: cid,
+          items: planItemsFromRuntimeTodos(todos),
+          status: runningRunForConversation(runtimeRef.current.runs, cid) ? "running" : "completed"
+        });
+        return;
+      }
+      if (parsed.type === "conversation_title_updated") {
+        if (cid === conversationIdRef.current) {
+          scheduleSseInvalidation(`conversation:${cid}`, ["conversation", cid]);
+        }
+        scheduleSseInvalidation("conversations", ["conversations"]);
+        return;
+      }
+      let scopedRun = runningRunForConversation(runtimeRef.current.runs, cid) ||
+        recentCompletedRunForConversation(runtimeRef.current.runs, cid);
       if (!scopedRun) {
         const task = runtimeRef.current.activeTasks.find((item) => item.conversationId === cid);
         dispatch({
@@ -606,14 +755,26 @@ export function ChatWorkbench() {
       const scopedRunId = scopedRun?.id || runtimeRef.current.runs.find((run) => run.conversationId === cid)?.id;
       adaptSSE(parsed).forEach((action) => dispatch({ ...action, runId: scopedRunId } as RuntimeAction));
       if (isTerminalRunEnvelope(parsed)) {
-        queryClient.invalidateQueries({ queryKey: ["conversation", cid] }).catch(() => undefined);
-        queryClient.invalidateQueries({ queryKey: ["conversations"] }).catch(() => undefined);
-        queryClient.invalidateQueries({ queryKey: ["tasks"] }).catch(() => undefined);
+        if (cid === conversationIdRef.current) {
+          scheduleSseInvalidation(`conversation:${cid}`, ["conversation", cid]);
+        }
+        scheduleSseInvalidation("conversations", ["conversations"]);
+        scheduleSseInvalidation("tasks", ["tasks"]);
       }
     };
-    source.onerror = () => undefined;
+    source.onerror = () => {
+      const now = Date.now();
+      if (now - lastSseFallbackRef.current < 30_000) return;
+      lastSseFallbackRef.current = now;
+      queryClient.invalidateQueries({ queryKey: ["tasks"] }).catch(() => undefined);
+      const cid = conversationIdRef.current;
+      if (cid) {
+        queryClient.invalidateQueries({ queryKey: ["hitl-pending", cid] }).catch(() => undefined);
+        queryClient.invalidateQueries({ queryKey: ["runtime-todos", cid] }).catch(() => undefined);
+      }
+    };
     return () => source.close();
-  }, [queryClient, dispatch]);
+  }, [queryClient, dispatch, scheduleSseInvalidation]);
 
   const liveMessages = useMemo(() => {
     if (!activeConversationRun) return messages;

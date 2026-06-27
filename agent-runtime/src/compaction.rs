@@ -142,7 +142,7 @@ impl CompactionRuntime {
     pub fn should_compact(&self, messages: &[ChatMessage]) -> bool {
         self.enabled
             && self.compaction_count < self.max_compactions_per_turn
-            && estimate_chars(messages) >= self.threshold_chars
+            && estimate_compactable_chars(messages) >= self.threshold_chars
     }
 
     pub fn start_task(&self, turn_id: &str, messages: &[ChatMessage]) -> CompactionTask {
@@ -352,6 +352,14 @@ fn estimate_chars(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
+fn estimate_compactable_chars(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.role != "system")
+        .map(|message| estimate_chars(std::slice::from_ref(message)))
+        .sum()
+}
+
 fn build_summary(messages: &[ChatMessage], plan: &PlanStore) -> String {
     let mut lines = Vec::new();
     if !plan.event_items().is_empty() {
@@ -522,6 +530,20 @@ mod tests {
             .unwrap_or_default()
             .contains("COMPACTED_CONTEXT_SUMMARY")));
         assert!(!runtime.should_compact(&result.messages));
+    }
+
+    #[test]
+    fn should_not_compact_only_because_system_prompt_is_large() {
+        let mut context = Map::new();
+        context.insert("compaction_enabled".to_string(), Value::Bool(true));
+        context.insert("compaction_threshold_chars".to_string(), json!(10));
+        let runtime = CompactionRuntime::from_context(&context);
+        let messages = vec![
+            ChatMessage::system("x".repeat(100)),
+            ChatMessage::user("short"),
+        ];
+
+        assert!(!runtime.should_compact(&messages));
     }
 
     #[test]

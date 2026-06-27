@@ -1,0 +1,137 @@
+syntax = "proto3";
+
+package cyberstrike.agent_runtime.v1;
+
+option go_package = "cyberstrike-ai/internal/agentruntime/pb;agentruntimepb";
+
+service AgentRuntimeService {
+  rpc Run(stream RuntimeCommand) returns (stream RuntimeEvent);
+  rpc InterruptTurn(InterruptTurnRequest) returns (InterruptTurnResponse);
+  rpc ResumeApproval(ResumeApprovalRequest) returns (stream RuntimeEvent);
+  rpc GetRunState(GetRunStateRequest) returns (GetRunStateResponse);
+  rpc ListRunStates(ListRunStatesRequest) returns (ListRunStatesResponse);
+  rpc ListEvents(ListEventsRequest) returns (ListEventsResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message RuntimeCommand {
+  string type = 1;
+  string command_id = 2;
+  string conversation_id = 3;
+  string runtime_session_id = 4;
+  string message = 5;
+  string context_json = 6;
+  string reason = 7;
+  bool continue_after = 8;
+  string request_id = 9;
+  string decision = 10;
+  string approval_message = 11;
+  string raw_json = 100;
+}
+
+message RuntimeEvent {
+  string type = 1;
+  string command_id = 2;
+  string conversation_id = 3;
+  string runtime_session_id = 4;
+  string turn_id = 5;
+  string delta = 6;
+  string accumulated = 7;
+  string response = 8;
+  string reason = 9;
+  string message = 10;
+  repeated PlanItem items = 11;
+  string tool_call_id = 12;
+  string tool_name = 13;
+  string arguments_json = 14;
+  string result = 15;
+  string error = 16;
+  string request_id = 17;
+  string permission = 18;
+  string decision = 19;
+  string summary = 20;
+  string task_id = 21;
+  string strategy = 22;
+  int64 input_message_count = 23;
+  int64 input_chars = 24;
+  int64 replacement_message_count = 25;
+  string artifact_path = 26;
+  string event_id = 27;
+  string runtime_event_type = 28;
+  string runtime_trace_json = 29;
+  string payload_json = 30;
+  string occurred_at = 31;
+  string sequence = 32;
+  string assistant_message_id = 33;
+  string raw_json = 100;
+}
+
+message PlanItem {
+  string id = 1;
+  string step = 2;
+  string status = 3;
+  string priority = 4;
+}
+
+message InterruptTurnRequest {
+  string conversation_id = 1;
+  string reason = 2;
+  bool continue_after = 3;
+}
+
+message InterruptTurnResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message ResumeApprovalRequest {
+  string command_id = 1;
+  string conversation_id = 2;
+  string runtime_session_id = 3;
+  string request_id = 4;
+  string decision = 5;
+  string message = 6;
+  string context_json = 7;
+  string raw_json = 100;
+}
+
+message GetRunStateRequest {
+  string conversation_id = 1;
+}
+
+message GetRunStateResponse {
+  RunState state = 1;
+}
+
+message ListRunStatesRequest {}
+
+message ListRunStatesResponse {
+  repeated RunState states = 1;
+}
+
+message ListEventsRequest {
+  string conversation_id = 1;
+  string after_event_id = 2;
+  int32 limit = 3;
+}
+
+message ListEventsResponse {
+  repeated RuntimeEvent events = 1;
+}
+
+message RunState {
+  string conversation_id = 1;
+  string runtime_session_id = 2;
+  string turn_id = 3;
+  string status = 4;
+  string message = 5;
+  string updated_at = 6;
+  string assistant_message_id = 7;
+}
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ok = 1;
+  string message = 2;
+}

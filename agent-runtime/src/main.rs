@@ -2,11 +2,15 @@ mod cancellation;
 mod compaction;
 mod event_protocol;
 mod filesystem_runtime;
+mod grpc_protocol;
+mod grpc_server;
 mod knowledge_runtime;
 mod mcp_bridge;
+mod mcp_registry;
 mod model_stream;
 mod permission;
 mod plan_store;
+mod runtime_state;
 mod session_loop;
 mod session_store;
 mod skill_runtime;
@@ -22,12 +26,82 @@ use std::thread::{self, JoinHandle};
 use anyhow::{Context, Result};
 use cancellation::CancellationRegistry;
 use event_protocol::{RuntimeCommand, RuntimeEvent};
+use runtime_state::RuntimeStateStore;
 use submission_loop::SubmissionLoop;
 
-fn main() -> Result<()> {
-    let stdin = io::stdin();
+#[tokio::main]
+async fn main() -> Result<()> {
+    let args = RuntimeArgs::parse();
     let cancellations = CancellationRegistry::default();
     let submission_loop = SubmissionLoop::with_cancellations(cancellations.clone());
+    if args.transport == "grpc" {
+        let runtime_state = RuntimeStateStore::new_required(args.redis_addr, args.redis_prefix)
+            .map_err(anyhow::Error::msg)?;
+        return grpc_server::serve_grpc(
+            &args.listen,
+            submission_loop,
+            cancellations,
+            runtime_state,
+        )
+        .await;
+    }
+    run_jsonl(submission_loop, cancellations)
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeArgs {
+    transport: String,
+    listen: String,
+    redis_addr: Option<String>,
+    redis_prefix: String,
+}
+
+impl RuntimeArgs {
+    fn parse() -> Self {
+        let mut transport = "jsonl".to_string();
+        let mut listen = "127.0.0.1:0".to_string();
+        let mut redis_addr = None;
+        let mut redis_prefix = "csai:agent_runtime:".to_string();
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--transport" => {
+                    if let Some(value) = args.next() {
+                        transport = value;
+                    }
+                }
+                "--listen" | "--grpc-listen" => {
+                    if let Some(value) = args.next() {
+                        listen = value;
+                    }
+                }
+                "--redis-addr" => {
+                    redis_addr = args
+                        .next()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+                }
+                "--redis-prefix" => {
+                    if let Some(value) = args.next() {
+                        if !value.trim().is_empty() {
+                            redis_prefix = value;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Self {
+            transport,
+            listen,
+            redis_addr,
+            redis_prefix,
+        }
+    }
+}
+
+fn run_jsonl(submission_loop: SubmissionLoop, cancellations: CancellationRegistry) -> Result<()> {
+    let stdin = io::stdin();
     let (event_tx, event_rx) = mpsc::channel::<RuntimeEvent>();
     let writer = thread::spawn(move || -> Result<()> {
         let mut stdout = io::BufWriter::new(io::stdout().lock());

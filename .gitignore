@@ -10,6 +10,9 @@ apps/chat-web/node_modules/
 apps/chat-web/dist/
 apps/chat-web/.test-dist/
 agent-runtime/target/
+rustapi/target/
+.playwright-cli/
+output/
 
 # Machine-local config and binaries
 config.yaml

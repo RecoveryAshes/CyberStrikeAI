@@ -64,7 +64,7 @@ fn context_u64(context: &Map<String, Value>, key: &str) -> Option<u64> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ModelStream {
     config: Option<ModelConfig>,
     client: reqwest::blocking::Client,
@@ -573,6 +573,11 @@ impl ModelStream {
                     .unwrap_or_default()
                     .contains("SIMULATE_MCP_CALL")
         });
+        let mcp_search_already_ran = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .filter_map(|m| m.content.as_deref())
+            .any(|content| content.contains("\"tool\":\"tool_search\""));
         let mcp_already_ran = messages
             .iter()
             .filter(|m| m.role == "tool")
@@ -581,6 +586,13 @@ impl ModelStream {
                 content.contains("\"tool_kind\":\"mcp\"")
                     || content.contains("\"tool\":\"mcp_call\"")
             });
+        let mcp_budget_blocked = messages.iter().any(|m| {
+            m.role == "system"
+                && m.content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("MCP_SCHEMA_BUDGET_BLOCKED")
+        });
 
         if plan_tool_results.is_empty()
             && (plan_first_required || should_local_plan_first(messages))
@@ -636,12 +648,24 @@ impl ModelStream {
         }
 
         if should_simulate_mcp && !mcp_already_ran {
+            if !mcp_search_already_ran {
+                return ModelTurn {
+                    content: String::new(),
+                    reasoning: "searching deferred MCP catalog before loading schema".to_string(),
+                    tool_calls: vec![local_tool_call(
+                        "tool_search",
+                        json!({ "query": "select:lookup" }),
+                    )],
+                    streamed_content: false,
+                    streamed_reasoning: false,
+                };
+            }
             let direct_mcp_tool = self.tools.as_array().and_then(|items| {
                 items.iter().find_map(|item| {
                     item.get("function")
                         .and_then(|function| function.get("name"))
                         .and_then(Value::as_str)
-                        .filter(|name| name.starts_with("mcp__"))
+                        .filter(|name| !is_builtin_local_tool_name(name))
                 })
             });
             if let Some(tool_name) = direct_mcp_tool {
@@ -650,6 +674,15 @@ impl ModelStream {
                     reasoning: "calling available first-class MCP tool through runtime registry"
                         .to_string(),
                     tool_calls: vec![local_tool_call(tool_name, json!({ "query": user_message }))],
+                    streamed_content: false,
+                    streamed_reasoning: false,
+                };
+            }
+            if mcp_budget_blocked {
+                return ModelTurn {
+                    content: "MCP selected tool schema is budget_blocked; compress history or select a smaller tool before calling it.".to_string(),
+                    reasoning: "selected MCP schema is budget blocked".to_string(),
+                    tool_calls: Vec::new(),
                     streamed_content: false,
                     streamed_reasoning: false,
                 };
@@ -768,6 +801,26 @@ fn local_tool_call(name: &str, args: Value) -> ModelToolCall {
             arguments: args.to_string(),
         },
     }
+}
+
+fn is_builtin_local_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "update_plan"
+            | "todowrite"
+            | "runtime_echo"
+            | "skill"
+            | "mcp_call"
+            | "tool_search"
+            | "knowledge_search"
+            | "ls"
+            | "read_file"
+            | "write_file"
+            | "edit_file"
+            | "glob"
+            | "grep"
+            | "execute"
+    )
 }
 
 #[cfg(test)]

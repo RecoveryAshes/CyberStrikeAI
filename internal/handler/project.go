@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"context"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"cyberstrike-ai/internal/attackchain"
 	"cyberstrike-ai/internal/database"
@@ -70,6 +73,9 @@ func (h *ProjectHandler) CreateProject(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	if err := h.syncProjectToRust(c.Request.Context(), created); err != nil {
+		h.logger.Warn("同步项目到 Rust API 失败", zap.String("project_id", created.ID), zap.Error(err))
+	}
 	c.JSON(http.StatusOK, created)
 }
 
@@ -96,35 +102,26 @@ func (h *ProjectHandler) GetDashboardSummary(c *gin.Context) {
 
 // ListProjects GET /api/projects
 func (h *ProjectHandler) ListProjects(c *gin.Context) {
-	status := c.Query("status")
-	search := c.Query("search")
-	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "50"))
-	offset, _ := strconv.Atoi(c.Query("offset"))
-	if limit <= 0 {
-		limit = 50
-	}
-	if limit > 500 {
-		limit = 500
-	}
-	list, err := h.db.ListProjects(status, search, limit, offset)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	if err := h.syncProjectsToRust(c.Request.Context()); err != nil {
+		h.log().Error("同步项目到 Rust API 失败", zap.Error(err))
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Rust API projects sync failed: " + err.Error()})
 		return
 	}
-	if list == nil {
-		list = []*database.Project{}
-	}
-	total, err := h.db.CountProjects(status, search)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	status, body, contentType, ok := proxyRequestToRust(c, nil, "/api/projects", c.Request.URL.RawQuery, h.log(), "Rust API 项目")
+	if !ok {
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"projects": list,
-		"total":    total,
-		"limit":    limit,
-		"offset":   offset,
-	})
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/json; charset=utf-8"
+	}
+	c.Data(status, contentType, body)
+}
+
+func (h *ProjectHandler) log() *zap.Logger {
+	if h != nil && h.logger != nil {
+		return h.logger
+	}
+	return zap.NewNop()
 }
 
 // GetProjectStats GET /api/projects/:id/stats
@@ -213,16 +210,56 @@ func (h *ProjectHandler) UpdateProject(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	if err := h.syncProjectToRust(c.Request.Context(), p); err != nil {
+		h.logger.Warn("同步项目到 Rust API 失败", zap.String("project_id", p.ID), zap.Error(err))
+	}
 	c.JSON(http.StatusOK, p)
 }
 
 // DeleteProject DELETE /api/projects/:id
 func (h *ProjectHandler) DeleteProject(c *gin.Context) {
-	if err := h.db.DeleteProject(c.Param("id")); err != nil {
+	id := c.Param("id")
+	if err := h.db.DeleteProject(id); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	if err := deleteRustResource(c.Request.Context(), nil, "/api/internal/projects/"+url.PathEscape(id)); err != nil {
+		h.logger.Warn("从 Rust API 删除项目失败", zap.String("project_id", id), zap.Error(err))
+	}
 	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+func (h *ProjectHandler) syncProjectsToRust(ctx context.Context) error {
+	if h == nil || h.db == nil {
+		return nil
+	}
+	projects, err := h.db.ListProjects("", "", 500, 0)
+	if err != nil {
+		return fmt.Errorf("read local projects: %w", err)
+	}
+	for _, p := range projects {
+		if err := h.syncProjectToRust(ctx, p); err != nil {
+			return fmt.Errorf("sync project %q: %w", p.ID, err)
+		}
+	}
+	return nil
+}
+
+func (h *ProjectHandler) syncProjectToRust(ctx context.Context, p *database.Project) error {
+	if p == nil || strings.TrimSpace(p.ID) == "" || strings.TrimSpace(p.Name) == "" {
+		return nil
+	}
+	payload := map[string]interface{}{
+		"id":          p.ID,
+		"name":        p.Name,
+		"description": p.Description,
+		"scope_json":  p.ScopeJSON,
+		"status":      p.Status,
+		"pinned":      p.Pinned,
+		"created_at":  p.CreatedAt.UTC().Format(time.RFC3339Nano),
+		"updated_at":  p.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	}
+	return postJSONToRust(ctx, nil, "/api/internal/projects", payload)
 }
 
 type factLinkRequest struct {

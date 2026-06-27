@@ -30,6 +30,7 @@ type Command struct {
 
 type Event struct {
 	Type                    string                 `json:"type"`
+	EventID                 string                 `json:"event_id,omitempty"`
 	CommandID               string                 `json:"command_id,omitempty"`
 	ConversationID          string                 `json:"conversation_id,omitempty"`
 	RuntimeSessionID        string                 `json:"runtime_session_id,omitempty"`
@@ -55,6 +56,12 @@ type Event struct {
 	InputChars              int                    `json:"input_chars,omitempty"`
 	ReplacementMessageCount int                    `json:"replacement_message_count,omitempty"`
 	ArtifactPath            string                 `json:"artifact_path,omitempty"`
+	RuntimeEventType        string                 `json:"runtime_event_type,omitempty"`
+	RuntimeTraceJSON        string                 `json:"runtime_trace_json,omitempty"`
+	PayloadJSON             string                 `json:"payload_json,omitempty"`
+	OccurredAt              string                 `json:"occurred_at,omitempty"`
+	Sequence                string                 `json:"sequence,omitempty"`
+	AssistantMessageID      string                 `json:"assistant_message_id,omitempty"`
 	Raw                     map[string]interface{} `json:"-"`
 }
 

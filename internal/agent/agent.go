@@ -91,15 +91,15 @@ func NewAgent(cfg *config.OpenAIConfig, agentCfg *config.AgentConfig, mcpServer 
 	llmClient := openai.NewClient(cfg, httpClient, logger)
 
 	return &Agent{
-		openAIClient:         llmClient,
-		config:               cfg,
-		agentConfig:          agentCfg,
-		mcpServer:            mcpServer,
-		externalMCPMgr:       externalMCPMgr,
-		logger:               logger,
-		maxIterations:        maxIterations,
-		toolNameMapping:      make(map[string]string), // 初始化工具名称映射
-		toolDescriptionMode:  "short",
+		openAIClient:        llmClient,
+		config:              cfg,
+		agentConfig:         agentCfg,
+		mcpServer:           mcpServer,
+		externalMCPMgr:      externalMCPMgr,
+		logger:              logger,
+		maxIterations:       maxIterations,
+		toolNameMapping:     make(map[string]string), // 初始化工具名称映射
+		toolDescriptionMode: "short",
 	}
 }
 
@@ -632,6 +632,9 @@ func (a *Agent) UpdateConfig(cfg *config.OpenAIConfig) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.config = cfg
+	if a.openAIClient != nil {
+		a.openAIClient.UpdateConfig(cfg)
+	}
 
 	a.logger.Info("Agent配置已更新",
 		zap.String("base_url", cfg.BaseURL),

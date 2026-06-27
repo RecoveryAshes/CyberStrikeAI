@@ -1,13 +1,14 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"math"
+	"io"
 	"net/http"
-	"strconv"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -28,9 +29,10 @@ type hitlRuntimeConfig struct {
 }
 
 type hitlDecision struct {
-	Decision        string
-	Comment         string
-	EditedArguments map[string]interface{}
+	Decision           string
+	Comment            string
+	EditedArguments    map[string]interface{}
+	RustAlreadyUpdated bool
 }
 
 type pendingInterrupt struct {
@@ -54,9 +56,15 @@ type hitlInterruptRecord struct {
 	Decision       string
 }
 
+type hitlInterruptMirror interface {
+	CreatePendingInterrupt(context.Context, hitlInterruptRecord) error
+	ResolveInterrupt(context.Context, string, string, string, map[string]interface{}) error
+}
+
 type HITLManager struct {
 	db     *database.DB
 	logger *zap.Logger
+	mirror hitlInterruptMirror
 
 	mu      sync.RWMutex
 	runtime map[string]hitlRuntimeConfig
@@ -84,6 +92,15 @@ func NewHITLManager(db *database.DB, logger *zap.Logger) *HITLManager {
 		runtime: make(map[string]hitlRuntimeConfig),
 		pending: make(map[string]*pendingInterrupt),
 	}
+}
+
+func (m *HITLManager) SetMirror(mirror hitlInterruptMirror) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.mirror = mirror
 }
 
 func (m *HITLManager) EnsureSchema() error {
@@ -242,6 +259,84 @@ func (h *AgentHandler) hitlRequestWithMergedConfigWhitelist(req *HITLRequest) *H
 	return &out
 }
 
+type rustHITLInterruptMirror struct {
+	client   *http.Client
+	clientFn func() *http.Client
+	logger   *zap.Logger
+}
+
+func (m *rustHITLInterruptMirror) CreatePendingInterrupt(ctx context.Context, rec hitlInterruptRecord) error {
+	payload := map[string]interface{}{
+		"id":             rec.InterruptID,
+		"conversationId": rec.ConversationID,
+		"messageId":      rec.MessageID,
+		"mode":           rec.Mode,
+		"toolName":       rec.ToolName,
+		"toolCallId":     rec.ToolCallID,
+		"payload":        rec.Payload,
+		"status":         "pending",
+	}
+	return m.postJSON(ctx, "/api/internal/hitl/interrupts", payload)
+}
+
+func (m *rustHITLInterruptMirror) ResolveInterrupt(ctx context.Context, interruptID, decision, comment string, editedArguments map[string]interface{}) error {
+	payload := map[string]interface{}{
+		"interruptId": interruptID,
+		"decision":    decision,
+		"comment":     comment,
+	}
+	if editedArguments != nil {
+		payload["editedArguments"] = editedArguments
+	}
+	return m.postJSON(ctx, "/api/hitl/decision", payload)
+}
+
+func (m *rustHITLInterruptMirror) postJSON(ctx context.Context, path string, payload map[string]interface{}) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	cfg := rustAPIProxyConfigFromEnv()
+	target, err := rustAPITarget(cfg, path, "")
+	if err != nil {
+		return err
+	}
+	timeoutSeconds := cfg.TimeoutSeconds
+	if timeoutSeconds <= 0 || timeoutSeconds > 5 {
+		timeoutSeconds = 5
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, target.String(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	client := http.DefaultClient
+	if m != nil {
+		if m.clientFn != nil {
+			if c := m.clientFn(); c != nil {
+				client = c
+			}
+		} else if m.client != nil {
+			client = m.client
+		}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		respBody, _ := io.ReadAll(resp.Body)
+		return errors.New("Rust API HITL mirror returned " + resp.Status + ": " + strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
 func (m *HITLManager) shouldInterrupt(conversationID, toolName string) (hitlRuntimeConfig, bool) {
 	m.mu.RLock()
 	cfg, ok := m.runtime[conversationID]
@@ -286,6 +381,20 @@ func (m *HITLManager) CreatePendingInterruptWithID(id, conversationID, assistant
 	}
 	// 刷新页面后侧栏依赖 DB 配置；若仅内存 Activate 未落库，会导致「有待审批却显示关闭」
 	_ = m.ensureConversationHITLModePersisted(conversationID, mode)
+	rec := hitlInterruptRecord{
+		InterruptID:    id,
+		ConversationID: conversationID,
+		MessageID:      assistantMessageID,
+		Mode:           mode,
+		ToolName:       toolName,
+		ToolCallID:     toolCallID,
+		Payload:        payload,
+		Status:         "pending",
+	}
+	if err := m.mirrorPendingInterrupt(context.Background(), rec); err != nil {
+		_, _ = m.db.Exec(`DELETE FROM hitl_interrupts WHERE id=? AND status='pending'`, id)
+		return nil, err
+	}
 	p := &pendingInterrupt{
 		ConversationID: conversationID,
 		InterruptID:    id,
@@ -298,6 +407,38 @@ func (m *HITLManager) CreatePendingInterruptWithID(id, conversationID, assistant
 	m.pending[id] = p
 	m.mu.Unlock()
 	return p, nil
+}
+
+func (m *HITLManager) mirrorPendingInterrupt(ctx context.Context, rec hitlInterruptRecord) error {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	mirror := m.mirror
+	m.mu.RUnlock()
+	if mirror == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return mirror.CreatePendingInterrupt(ctx, rec)
+}
+
+func (m *HITLManager) mirrorInterruptDecision(ctx context.Context, interruptID, decision, comment string, editedArguments map[string]interface{}) error {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	mirror := m.mirror
+	m.mu.RUnlock()
+	if mirror == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return mirror.ResolveInterrupt(ctx, interruptID, decision, comment, editedArguments)
 }
 
 // ensureConversationHITLModePersisted 在产生待审批时把 mode 写入 hitl_conversation_configs，避免刷新后 GET 配置仍为关闭。
@@ -375,6 +516,9 @@ func (m *HITLManager) ResolveInterrupt(interruptID, decision, comment string, ed
 		m.mu.Lock()
 		delete(m.pending, interruptID)
 		m.mu.Unlock()
+		if err := m.mirrorInterruptDecision(context.Background(), interruptID, decision, strings.TrimSpace(comment), editedArguments); err != nil {
+			return err
+		}
 		return nil
 	}
 	if !ok {
@@ -384,6 +528,9 @@ func (m *HITLManager) ResolveInterrupt(interruptID, decision, comment string, ed
 			return err
 		}
 		if n, _ := res.RowsAffected(); n > 0 {
+			if err := m.mirrorInterruptDecision(context.Background(), interruptID, decision, strings.TrimSpace(comment), editedArguments); err != nil {
+				return err
+			}
 			return nil
 		}
 		return errors.New("interrupt not found or already resolved")
@@ -398,6 +545,34 @@ func (m *HITLManager) ResolveInterrupt(interruptID, decision, comment string, ed
 		return nil
 	default:
 		return errors.New("interrupt already resolved or decision channel busy")
+	}
+}
+
+func (m *HITLManager) DeliverLocalDecision(interruptID, decision, comment string, editedArguments map[string]interface{}, rustAlreadyUpdated ...bool) bool {
+	if m == nil {
+		return false
+	}
+	decision = strings.ToLower(strings.TrimSpace(decision))
+	if decision != "approve" && decision != "reject" {
+		return false
+	}
+	m.mu.RLock()
+	p, ok := m.pending[interruptID]
+	m.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	d := hitlDecision{
+		Decision:           decision,
+		Comment:            strings.TrimSpace(comment),
+		EditedArguments:    editedArguments,
+		RustAlreadyUpdated: len(rustAlreadyUpdated) > 0 && rustAlreadyUpdated[0],
+	}
+	select {
+	case p.decideCh <- d:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -471,14 +646,19 @@ func (m *HITLManager) waitDecision(ctx context.Context, p *pendingInterrupt, tim
 		}
 		_, _ = m.db.Exec(`UPDATE hitl_interrupts SET status='decided', decision=?, decision_comment=?, decided_at=? WHERE id=?`,
 			d.Decision, d.Comment, time.Now(), p.InterruptID)
+		if !d.RustAlreadyUpdated {
+			_ = m.mirrorInterruptDecision(ctx, p.InterruptID, d.Decision, d.Comment, d.EditedArguments)
+		}
 		return d, nil
 	case <-timeoutCh:
 		_, _ = m.db.Exec(`UPDATE hitl_interrupts SET status='timeout', decision='approve', decision_comment='timeout auto approve', decided_at=? WHERE id=?`,
 			time.Now(), p.InterruptID)
+		_ = m.mirrorInterruptDecision(ctx, p.InterruptID, "approve", "timeout auto approve", nil)
 		return hitlDecision{Decision: "approve", Comment: "timeout auto approve"}, nil
 	case <-ctx.Done():
 		_, _ = m.db.Exec(`UPDATE hitl_interrupts SET status='cancelled', decision='reject', decision_comment='task cancelled', decided_at=? WHERE id=?`,
 			time.Now(), p.InterruptID)
+		_ = m.mirrorInterruptDecision(context.Background(), p.InterruptID, "reject", "task cancelled", nil)
 		return hitlDecision{Decision: "reject", Comment: "task cancelled"}, ctx.Err()
 	}
 }
@@ -583,76 +763,13 @@ func (h *AgentHandler) handleHITLToolCall(runCtx context.Context, cancelRun cont
 }
 
 func (h *AgentHandler) ListHITLPending(c *gin.Context) {
-	conversationID := strings.TrimSpace(c.Query("conversationId"))
-	status := strings.TrimSpace(c.Query("status"))
-	if status == "" {
-		status = "pending"
-	}
-	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	if page < 1 {
-		page = 1
-	}
-	pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "20"))
-	pageSize = int(math.Max(1, math.Min(float64(pageSize), 200)))
-	offset := (page - 1) * pageSize
-	q := `SELECT id, conversation_id, message_id, mode, tool_name, tool_call_id, payload, status, decision, decision_comment, created_at, decided_at FROM hitl_interrupts WHERE 1=1`
-	args := []interface{}{}
-	if conversationID != "" {
-		q += " AND conversation_id = ?"
-		args = append(args, conversationID)
-	}
-	if status != "all" {
-		q += " AND status = ?"
-		args = append(args, status)
-	}
-	q += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-	args = append(args, pageSize, offset)
-	rows, err := h.db.Query(q, args...)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
-	}
-	defer rows.Close()
-	items := make([]map[string]interface{}, 0)
-	for rows.Next() {
-		var id, cid, mode, toolName, toolCallID, payload, rowStatus string
-		var messageID sql.NullString
-		var decision, comment sql.NullString
-		var createdAt time.Time
-		var decidedAt sql.NullTime
-		if err := rows.Scan(&id, &cid, &messageID, &mode, &toolName, &toolCallID, &payload, &rowStatus, &decision, &comment, &createdAt, &decidedAt); err != nil {
-			continue
-		}
-		msgID := ""
-		if messageID.Valid {
-			msgID = messageID.String
-		}
-		items = append(items, map[string]interface{}{
-			"id":             id,
-			"conversationId": cid,
-			"messageId":      msgID,
-			"mode":           mode,
-			"toolName":       toolName,
-			"toolCallId":     toolCallID,
-			"payload":        payload,
-			"status":         rowStatus,
-			"decision":       decision.String,
-			"comment":        comment.String,
-			"createdAt":      createdAt,
-			"decidedAt": func() interface{} {
-				if decidedAt.Valid {
-					return decidedAt.Time
-				}
-				return nil
-			}(),
-		})
-	}
-	c.JSON(http.StatusOK, gin.H{"items": items, "page": page, "pageSize": pageSize})
+	h.proxyHITLToRustAndWrite(c, "/api/hitl/pending")
 }
 
 type hitlDecisionReq struct {
 	InterruptID     string                 `json:"interruptId" binding:"required"`
-	Decision        string                 `json:"decision" binding:"required"`
+	Decision        string                 `json:"decision,omitempty"`
+	Reply           string                 `json:"reply,omitempty"`
 	Comment         string                 `json:"comment,omitempty"`
 	EditedArguments map[string]interface{} `json:"editedArguments,omitempty"`
 }
@@ -663,26 +780,22 @@ func (h *AgentHandler) DecideHITLInterrupt(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	if h.hitlManager == nil {
-		c.JSON(500, gin.H{"error": "hitl manager unavailable"})
+	body, _ := json.Marshal(req)
+	status, respBody, contentType, ok := h.proxyHITLBodyToRust(c, "/api/hitl/decision", body)
+	if !ok {
 		return
 	}
-	if err := h.hitlManager.ResolveInterrupt(req.InterruptID, req.Decision, req.Comment, req.EditedArguments); err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-		return
-	}
-	if strings.HasPrefix(req.InterruptID, "approval_") {
-		if err := h.resumeAgentRuntimeApproval(c.Request.Context(), req.InterruptID, req.Decision, req.Comment); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Agent Runtime 审批恢复失败: " + err.Error()})
-			return
+	if status >= 200 && status < 300 {
+		if h.audit != nil {
+			h.audit.RecordOK(c, "hitl", "decision", "HITL 审批决策", "hitl_interrupt", req.InterruptID, map[string]interface{}{
+				"decision": req.Decision,
+			})
 		}
 	}
-	if h.audit != nil {
-		h.audit.RecordOK(c, "hitl", "decision", "HITL 审批决策", "hitl_interrupt", req.InterruptID, map[string]interface{}{
-			"decision": req.Decision,
-		})
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/json; charset=utf-8"
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.Data(status, contentType, respBody)
 }
 
 func (h *AgentHandler) DismissHITLInterrupt(c *gin.Context) {
@@ -693,33 +806,20 @@ func (h *AgentHandler) DismissHITLInterrupt(c *gin.Context) {
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}
-	if h.hitlManager == nil {
-		c.JSON(500, gin.H{"error": "hitl manager unavailable"})
+	body, _ := json.Marshal(hitlDecisionReq{
+		InterruptID: req.InterruptID,
+		Decision:    "reject",
+		Reply:       "reject",
+		Comment:     "dismissed by user",
+	})
+	status, respBody, contentType, ok := h.proxyHITLBodyToRust(c, "/api/hitl/decision", body)
+	if !ok {
 		return
 	}
-	res, err := h.db.Exec(`UPDATE hitl_interrupts SET status='cancelled', decision='reject',
-		decision_comment='dismissed by user', decided_at=CURRENT_TIMESTAMP
-		WHERE id=? AND status='pending'`, req.InterruptID)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/json; charset=utf-8"
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		c.JSON(404, gin.H{"error": "interrupt not found or already resolved"})
-		return
-	}
-	// Also drain from in-memory map if present
-	h.hitlManager.mu.Lock()
-	if p, ok := h.hitlManager.pending[req.InterruptID]; ok {
-		delete(h.hitlManager.pending, req.InterruptID)
-		select {
-		case p.decideCh <- hitlDecision{Decision: "reject", Comment: "dismissed by user"}:
-		default:
-		}
-	}
-	h.hitlManager.mu.Unlock()
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.Data(status, contentType, respBody)
 }
 
 func (h *AgentHandler) interceptHITLForEinoTool(runCtx context.Context, cancelRun context.CancelCauseFunc, conversationID, assistantMessageID string, sendEventFunc func(eventType, message string, data interface{}), toolName, arguments string) (string, error) {
@@ -763,27 +863,7 @@ func (h *AgentHandler) GetHITLConversationConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "conversationId is required"})
 		return
 	}
-	cfg, err := h.hitlManager.LoadConversationConfig(conversationID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	if !hitlStoredConfigEffective(cfg) {
-		if pendMode, ok := h.hitlManager.PendingHITLInterruptMode(conversationID); ok {
-			cfg2 := *cfg
-			cfg2.Enabled = true
-			cfg2.Mode = normalizeHitlMode(pendMode)
-			if cfg2.TimeoutSeconds < 0 {
-				cfg2.TimeoutSeconds = 0
-			}
-			cfg = &cfg2
-		}
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"conversationId":          conversationID,
-		"hitl":                    cfg,
-		"hitlGlobalToolWhitelist": h.hitlConfigGlobalToolWhitelist(),
-	})
+	h.proxyHITLToRustAndWrite(c, "/api/hitl/config/"+url.PathEscape(conversationID))
 }
 
 func (h *AgentHandler) UpsertHITLConversationConfig(c *gin.Context) {
@@ -792,22 +872,59 @@ func (h *AgentHandler) UpsertHITLConversationConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	req.Mode = normalizeHitlMode(req.Mode)
-	if err := h.hitlManager.SaveConversationConfig(req.ConversationID, &req.HITLRequest); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	body, _ := json.Marshal(req)
+	status, respBody, contentType, ok := h.proxyHITLBodyToRust(c, "/api/hitl/config", body)
+	if !ok {
 		return
 	}
-	if h.hitlWhitelistSaver != nil && len(req.SensitiveTools) > 0 {
-		if err := h.hitlWhitelistSaver.MergeHitlToolWhitelistIntoConfig(req.SensitiveTools); err != nil {
-			h.logger.Warn("HITL 会话配置已保存，但合并工具白名单到 config.yaml 失败", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": "会话配置已保存，但写入 config.yaml 失败: " + err.Error(),
-			})
-			return
-		}
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/json; charset=utf-8"
 	}
-	h.hitlManager.ActivateConversation(req.ConversationID, h.hitlRequestWithMergedConfigWhitelist(&req.HITLRequest))
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.Data(status, contentType, respBody)
+}
+
+func (h *AgentHandler) proxyHITLToRustAndWrite(c *gin.Context, path string) {
+	status, body, contentType, ok := proxyRequestToRust(c, h.httpClient, path, c.Request.URL.RawQuery, h.log(), "Rust API HITL")
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/json; charset=utf-8"
+	}
+	c.Data(status, contentType, body)
+}
+
+func (h *AgentHandler) proxyHITLBodyToRust(c *gin.Context, path string, body []byte) (int, []byte, string, bool) {
+	originalBody := c.Request.Body
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	if len(body) > 0 {
+		c.Request.ContentLength = int64(len(body))
+	}
+	status, respBody, contentType, ok := proxyRequestToRust(c, h.httpClient, path, c.Request.URL.RawQuery, h.log(), "Rust API HITL")
+	c.Request.Body = originalBody
+	return status, respBody, contentType, ok
+}
+
+// afterRustHITLDecision is legacy-only. Rust-owned Agent Runtime HITL decisions
+// are resumed by rustapi through its in-process permission waiter.
+func (h *AgentHandler) afterRustHITLDecision(ctx context.Context, req hitlDecisionReq) error {
+	if strings.HasPrefix(req.InterruptID, "approval_") {
+		if err := h.resumeAgentRuntimeApproval(ctx, req.InterruptID, req.Decision, req.Comment); err != nil {
+			return errors.New("Agent Runtime 审批恢复失败: " + err.Error())
+		}
+		return nil
+	}
+	if h.hitlManager != nil {
+		h.hitlManager.DeliverLocalDecision(req.InterruptID, req.Decision, req.Comment, req.EditedArguments, true)
+	}
+	return nil
+}
+
+func (h *AgentHandler) log() *zap.Logger {
+	if h != nil && h.logger != nil {
+		return h.logger
+	}
+	return zap.NewNop()
 }
 
 type mergeHitlGlobalWhitelistReq struct {

@@ -78,7 +78,8 @@ impl McpBridge {
             .map(|items| items.iter().filter_map(parse_mcp_tool).collect())
             .unwrap_or_default();
         let endpoint_url = context
-            .get("mcp_endpoint_url")
+            .get("external_mcp_endpoint_url")
+            .or_else(|| context.get("mcp_endpoint_url"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|url| !url.is_empty())
@@ -187,6 +188,28 @@ impl McpBridge {
         self.execute_resolved_tool(tool, arguments, model_tool_name)
     }
 
+    pub fn execute_direct_tool(
+        &self,
+        server: &str,
+        name: &str,
+        call_name: &str,
+        arguments: Value,
+        model_tool_name: &str,
+    ) -> Result<String, McpBridgeError> {
+        let tool = McpTool {
+            server: server.to_string(),
+            name: name.to_string(),
+            call_name: call_name.to_string(),
+            model_name: Some(model_tool_name.to_string()),
+            transport: "external".to_string(),
+            description: String::new(),
+            input_schema: json!({"type":"object","properties":{}}),
+            enabled: true,
+            requires_approval: false,
+        };
+        self.execute_resolved_tool(&tool, arguments, model_tool_name)
+    }
+
     fn execute_resolved_tool(
         &self,
         tool: &McpTool,
@@ -213,6 +236,9 @@ impl McpBridge {
     }
 
     fn call_mcp_tool(&self, tool: &McpTool, arguments: Value) -> Result<Value, McpBridgeError> {
+        if tool.server == "builtin" || tool.transport == "builtin" {
+            return Err(McpBridgeError::MissingEndpoint);
+        }
         let endpoint = self
             .endpoint_url
             .as_deref()
@@ -303,7 +329,7 @@ impl McpTool {
     }
 }
 
-fn bounded_model_tool_name(server: &str, name: &str) -> String {
+pub fn bounded_model_tool_name(server: &str, name: &str) -> String {
     let server = sanitize_tool_segment(server);
     let name = sanitize_tool_segment(name);
     let candidate = format!("mcp__{}__{}", server, name);
@@ -324,7 +350,7 @@ fn bounded_model_tool_name(server: &str, name: &str) -> String {
     )
 }
 
-fn normalize_input_schema(schema: Value) -> Value {
+pub fn normalize_input_schema(schema: Value) -> Value {
     let mut obj = schema.as_object().cloned().unwrap_or_default();
     match obj.get("type").and_then(Value::as_str) {
         Some("object") => {}
@@ -573,13 +599,9 @@ mod tests {
     }
 
     #[test]
-    fn builtin_mcp_tool_uses_call_name_and_model_name() {
-        let (url, received_rx) = start_mock_mcp_server(
-            r#"{"jsonrpc":"2.0","id":"cyberstrike-agent-runtime-mcp-call","result":{"content":[{"type":"text","text":"file body"}]}}"#,
-        );
+    fn builtin_mcp_tool_is_not_executed_via_external_endpoint() {
         let mut context = Map::new();
         context.insert("mcp_enabled".to_string(), Value::Bool(true));
-        context.insert("mcp_endpoint_url".to_string(), Value::String(url));
         context.insert(
             "mcp_tools".to_string(),
             json!([
@@ -596,14 +618,10 @@ mod tests {
         assert_eq!(bridge.enabled_tool_count(), 1);
         assert_eq!(bridge.enabled_tools()[0].model_tool_name(), "read_file");
 
-        let result = bridge
+        let err = bridge
             .execute_tool("read_file", json!({"path": "README.md"}), "read_file")
-            .unwrap();
-        assert!(result.contains("file body"));
-
-        let received = received_rx.recv().unwrap();
-        assert!(received.contains("\"name\":\"read_file\""));
-        assert!(!received.contains("builtin::read_file"));
+            .unwrap_err();
+        assert!(matches!(err, McpBridgeError::MissingEndpoint));
     }
 
     #[test]

@@ -1,10 +1,15 @@
 package handler
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
-	"strconv"
+	"net/url"
 	"strings"
+	"time"
 
 	"cyberstrike-ai/internal/audit"
 	"cyberstrike-ai/internal/database"
@@ -32,6 +37,13 @@ func NewConversationHandler(db *database.DB, logger *zap.Logger) *ConversationHa
 	}
 }
 
+func (h *ConversationHandler) log() *zap.Logger {
+	if h != nil && h.logger != nil {
+		return h.logger
+	}
+	return zap.NewNop()
+}
+
 // CreateConversationRequest 创建对话请求
 type CreateConversationRequest struct {
 	Title     string `json:"title"`
@@ -45,123 +57,53 @@ type SetConversationProjectRequest struct {
 
 // CreateConversation 创建新对话
 func (h *ConversationHandler) CreateConversation(c *gin.Context) {
-	var req CreateConversationRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	_, status, body, contentType, ok := h.proxyConversationToRust(c, "/api/conversations")
+	if !ok {
 		return
 	}
-
-	title := req.Title
-	if title == "" {
-		title = "新对话"
+	if status >= http.StatusOK && status < http.StatusMultipleChoices {
+		h.bridgeRustCreatedConversationToLocal(c.Request.Context(), body)
 	}
-
-	meta := audit.ConversationCreateMetaFromGin(c, "api")
-	meta.ProjectID = strings.TrimSpace(req.ProjectID)
-	conv, err := h.db.CreateConversation(title, meta)
-	if err != nil {
-		h.logger.Error("创建对话失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, conv)
+	h.writeRustProxyResponse(c, status, body, contentType)
 }
 
 // SetConversationProject 设置或清除对话绑定的项目
 func (h *ConversationHandler) SetConversationProject(c *gin.Context) {
 	id := c.Param("id")
-	var req SetConversationProjectRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	raw, status, body, contentType, ok := h.proxyConversationToRust(c, "/api/conversations/"+url.PathEscape(id)+"/project")
+	if !ok {
 		return
 	}
-	if _, err := h.db.GetConversation(id); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "对话不存在"})
-		return
+	if status >= http.StatusOK && status < http.StatusMultipleChoices && h.db != nil {
+		var req SetConversationProjectRequest
+		if err := json.Unmarshal(raw, &req); err == nil {
+			if err := h.db.SetConversationProjectID(id, req.ProjectID); err != nil {
+				h.log().Debug("桥接会话项目到本地 SQLite 失败", zap.String("conversationId", id), zap.Error(err))
+			}
+		}
 	}
-	if err := h.db.SetConversationProjectID(id, req.ProjectID); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "projectId": strings.TrimSpace(req.ProjectID)})
+	h.writeRustProxyResponse(c, status, body, contentType)
 }
 
 // ListConversations 列出对话
 func (h *ConversationHandler) ListConversations(c *gin.Context) {
-	limitStr := c.DefaultQuery("limit", "50")
-	offsetStr := c.DefaultQuery("offset", "0")
-	search := c.Query("search") // 获取搜索参数
-
-	limit, _ := strconv.Atoi(limitStr)
-	offset, _ := strconv.Atoi(offsetStr)
-
-	if limit <= 0 {
-		limit = 50
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
-
-	excludeGrouped := strings.TrimSpace(search) == "" &&
-		(c.Query("exclude_grouped") == "true" || c.Query("exclude_grouped") == "1")
-	sortBy := strings.TrimSpace(c.Query("sort_by"))
-
-	var conversations []*database.Conversation
-	var total int
-	var err error
-	if excludeGrouped {
-		conversations, err = h.db.ListUngroupedConversations(limit, offset, sortBy)
-		if err == nil {
-			total, err = h.db.CountUngroupedConversations()
-		}
-	} else {
-		conversations, err = h.db.ListConversations(limit, offset, search, sortBy)
-		if err == nil {
-			total, err = h.db.CountConversations(search)
-		}
-	}
-	if err != nil {
-		h.logger.Error("获取对话列表失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	if conversations == nil {
-		conversations = []*database.Conversation{}
-	}
-	c.JSON(http.StatusOK, gin.H{
-		"conversations": conversations,
-		"total":         total,
-		"limit":         limit,
-		"offset":        offset,
-	})
+	h.proxyConversationToRustAndWrite(c, "/api/conversations")
 }
 
 // GetConversation 获取对话
 func (h *ConversationHandler) GetConversation(c *gin.Context) {
 	id := c.Param("id")
+	h.proxyConversationToRustAndWrite(c, "/api/conversations/"+url.PathEscape(id))
+}
 
-	// 默认轻量加载，只有用户需要展开详情时再按需拉取
-	// include_process_details=1/true 时返回全量 processDetails（兼容旧行为）
-	includeStr := c.DefaultQuery("include_process_details", "0")
-	include := includeStr == "1" || includeStr == "true" || includeStr == "yes"
-
-	var (
-		conv *database.Conversation
-		err  error
-	)
-	if include {
-		conv, err = h.db.GetConversation(id)
-	} else {
-		conv, err = h.db.GetConversationLite(id)
-	}
-	if err != nil {
-		h.logger.Error("获取对话失败", zap.Error(err))
-		c.JSON(http.StatusNotFound, gin.H{"error": "对话不存在"})
+// GetRuntimeTodos 获取会话级 Agent Runtime Todo 快照。
+func (h *ConversationHandler) GetRuntimeTodos(c *gin.Context) {
+	id := c.Param("id")
+	if strings.TrimSpace(id) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "conversation id required"})
 		return
 	}
-
-	c.JSON(http.StatusOK, conv)
+	h.proxyConversationToRustAndWrite(c, "/api/conversations/"+url.PathEscape(id)+"/runtime-todos")
 }
 
 // GetMessageProcessDetails 获取指定消息的过程详情（按需加载）
@@ -171,37 +113,7 @@ func (h *ConversationHandler) GetMessageProcessDetails(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "message id required"})
 		return
 	}
-
-	details, err := h.db.GetProcessDetails(messageID)
-	if err != nil {
-		h.logger.Error("获取过程详情失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	details = database.DedupeConsecutiveProcessDetails(details)
-
-	// 转换为前端期望的 JSON 结构（与 GetConversation 中 processDetails 结构一致）
-	out := make([]map[string]interface{}, 0, len(details))
-	for _, d := range details {
-		var data interface{}
-		if d.Data != "" {
-			if err := json.Unmarshal([]byte(d.Data), &data); err != nil {
-				h.logger.Warn("解析过程详情数据失败", zap.Error(err))
-			}
-		}
-		out = append(out, map[string]interface{}{
-			"id":             d.ID,
-			"messageId":      d.MessageID,
-			"conversationId": d.ConversationID,
-			"eventType":      d.EventType,
-			"message":        d.Message,
-			"data":           data,
-			"createdAt":      d.CreatedAt,
-		})
-	}
-
-	c.JSON(http.StatusOK, gin.H{"processDetails": out})
+	h.proxyConversationToRustAndWrite(c, "/api/messages/"+url.PathEscape(messageID)+"/process-details")
 }
 
 // UpdateConversationRequest 更新对话请求
@@ -212,46 +124,35 @@ type UpdateConversationRequest struct {
 // UpdateConversation 更新对话
 func (h *ConversationHandler) UpdateConversation(c *gin.Context) {
 	id := c.Param("id")
-
-	var req UpdateConversationRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	raw, status, body, contentType, ok := h.proxyConversationToRust(c, "/api/conversations/"+url.PathEscape(id))
+	if !ok {
 		return
 	}
-
-	if req.Title == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "标题不能为空"})
-		return
+	if status >= http.StatusOK && status < http.StatusMultipleChoices && h.db != nil {
+		var req UpdateConversationRequest
+		if err := json.Unmarshal(raw, &req); err == nil {
+			if err := h.db.UpdateConversationTitle(id, req.Title); err != nil {
+				h.log().Debug("桥接会话标题到本地 SQLite 失败", zap.String("conversationId", id), zap.Error(err))
+			}
+		}
 	}
-
-	if err := h.db.UpdateConversationTitle(id, req.Title); err != nil {
-		h.logger.Error("更新对话失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	// 返回更新后的对话
-	conv, err := h.db.GetConversation(id)
-	if err != nil {
-		h.logger.Error("获取更新后的对话失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	c.JSON(http.StatusOK, conv)
+	h.writeRustProxyResponse(c, status, body, contentType)
 }
 
 // DeleteConversation 删除对话
 func (h *ConversationHandler) DeleteConversation(c *gin.Context) {
 	id := c.Param("id")
-
-	if err := h.db.DeleteConversation(id); err != nil {
-		h.logger.Error("删除对话失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	_, status, body, contentType, ok := h.proxyConversationToRust(c, "/api/conversations/"+url.PathEscape(id))
+	if !ok {
 		return
 	}
-
-	if h.audit != nil {
+	if status >= http.StatusOK && status < http.StatusMultipleChoices && h.db != nil {
+		if err := h.db.DeleteConversation(id); err != nil {
+			h.log().Debug("桥接删除会话到本地 SQLite 失败", zap.String("conversationId", id), zap.Error(err))
+		}
+	}
+	h.writeRustProxyResponse(c, status, body, contentType)
+	if h.audit != nil && c.Writer.Status() >= http.StatusOK && c.Writer.Status() < http.StatusMultipleChoices {
 		h.audit.Record(c, audit.Entry{
 			Category:     "conversation",
 			Action:       "delete",
@@ -261,8 +162,187 @@ func (h *ConversationHandler) DeleteConversation(c *gin.Context) {
 			Message:      "删除对话",
 		})
 	}
+}
 
-	c.JSON(http.StatusOK, gin.H{"message": "删除成功"})
+func (h *ConversationHandler) proxyConversationToRustAndWrite(c *gin.Context, path string) {
+	_, status, body, contentType, ok := h.proxyConversationToRust(c, path)
+	if !ok {
+		return
+	}
+	h.writeRustProxyResponse(c, status, body, contentType)
+}
+
+func (h *ConversationHandler) proxyConversationToRust(c *gin.Context, path string) ([]byte, int, []byte, string, bool) {
+	raw, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "读取请求体失败: " + err.Error()})
+		return nil, 0, nil, "", false
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
+	c.Request.ContentLength = int64(len(raw))
+	status, body, contentType, ok := proxyRequestToRust(c, nil, path, c.Request.URL.RawQuery, h.log(), "Rust API 会话/消息")
+	c.Request.Body = io.NopCloser(bytes.NewReader(raw))
+	c.Request.ContentLength = int64(len(raw))
+	return raw, status, body, contentType, ok
+}
+
+func (h *ConversationHandler) writeRustProxyResponse(c *gin.Context, status int, body []byte, contentType string) {
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/json; charset=utf-8"
+	}
+	c.Data(status, contentType, body)
+}
+
+func (h *ConversationHandler) syncConversationsToRust(ctx context.Context) error {
+	if h == nil || h.db == nil {
+		return nil
+	}
+	const batchSize = 500
+	for offset := 0; ; offset += batchSize {
+		convs, err := h.db.ListConversations(batchSize, offset, "", "updated_at")
+		if err != nil {
+			return fmt.Errorf("read local conversations: %w", err)
+		}
+		if len(convs) == 0 {
+			return nil
+		}
+		for _, conv := range convs {
+			if conv == nil {
+				continue
+			}
+			if err := h.syncConversationToRustByID(ctx, conv.ID); err != nil {
+				return fmt.Errorf("sync conversation %q: %w", conv.ID, err)
+			}
+		}
+		if len(convs) < batchSize {
+			return nil
+		}
+	}
+}
+
+func (h *ConversationHandler) syncConversationToRustByID(ctx context.Context, id string) error {
+	if h == nil || h.db == nil || strings.TrimSpace(id) == "" {
+		return nil
+	}
+	conv, err := h.db.GetConversation(id)
+	if err != nil {
+		return err
+	}
+	if err := h.syncConversationRecordToRust(ctx, conv); err != nil {
+		return err
+	}
+	for i := range conv.Messages {
+		msg := conv.Messages[i]
+		if err := h.syncMessageRecordToRust(ctx, msg); err != nil {
+			return err
+		}
+		if err := h.syncProcessDetailsToRustByMessageID(ctx, msg.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *ConversationHandler) syncProcessDetailsToRustByMessageID(ctx context.Context, messageID string) error {
+	if h == nil || h.db == nil || strings.TrimSpace(messageID) == "" {
+		return nil
+	}
+	details, err := h.db.GetProcessDetails(messageID)
+	if err != nil {
+		return err
+	}
+	details = database.DedupeConsecutiveProcessDetails(details)
+	for _, detail := range details {
+		if err := h.syncProcessDetailRecordToRust(ctx, detail); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (h *ConversationHandler) syncConversationRecordToRust(ctx context.Context, conv *database.Conversation) error {
+	if conv == nil || strings.TrimSpace(conv.ID) == "" {
+		return nil
+	}
+	payload := map[string]interface{}{
+		"id":        conv.ID,
+		"title":     conv.Title,
+		"projectId": conv.ProjectID,
+		"pinned":    conv.Pinned,
+		"createdAt": conv.CreatedAt.UTC().Format(time.RFC3339Nano),
+		"updatedAt": conv.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	}
+	return postJSONToRust(ctx, nil, "/api/internal/conversations", payload)
+}
+
+func (h *ConversationHandler) syncMessageRecordToRust(ctx context.Context, msg database.Message) error {
+	if strings.TrimSpace(msg.ID) == "" || strings.TrimSpace(msg.ConversationID) == "" {
+		return nil
+	}
+	payload := map[string]interface{}{
+		"id":               msg.ID,
+		"conversationId":   msg.ConversationID,
+		"role":             msg.Role,
+		"content":          msg.Content,
+		"reasoningContent": msg.ReasoningContent,
+		"mcpExecutionIds":  msg.MCPExecutionIDs,
+		"createdAt":        msg.CreatedAt.UTC().Format(time.RFC3339Nano),
+		"updatedAt":        msg.UpdatedAt.UTC().Format(time.RFC3339Nano),
+	}
+	return postJSONToRust(ctx, nil, "/api/internal/messages", payload)
+}
+
+func (h *ConversationHandler) syncProcessDetailRecordToRust(ctx context.Context, detail database.ProcessDetail) error {
+	if strings.TrimSpace(detail.ID) == "" || strings.TrimSpace(detail.MessageID) == "" || strings.TrimSpace(detail.ConversationID) == "" {
+		return nil
+	}
+	var data interface{}
+	if strings.TrimSpace(detail.Data) != "" {
+		if err := json.Unmarshal([]byte(detail.Data), &data); err != nil {
+			h.log().Warn("解析过程详情数据失败", zap.String("processDetailId", detail.ID), zap.Error(err))
+			data = nil
+		}
+	}
+	payload := map[string]interface{}{
+		"id":             detail.ID,
+		"messageId":      detail.MessageID,
+		"conversationId": detail.ConversationID,
+		"eventType":      detail.EventType,
+		"message":        detail.Message,
+		"data":           data,
+		"createdAt":      detail.CreatedAt.UTC().Format(time.RFC3339Nano),
+	}
+	return postJSONToRust(ctx, nil, "/api/internal/process-details", payload)
+}
+
+func (h *ConversationHandler) bridgeRustCreatedConversationToLocal(ctx context.Context, body []byte) {
+	if h == nil || h.db == nil || len(body) == 0 {
+		return
+	}
+	var conv struct {
+		ID        string `json:"id"`
+		Title     string `json:"title"`
+		ProjectID string `json:"projectId"`
+	}
+	if err := json.Unmarshal(body, &conv); err != nil {
+		h.log().Debug("解析 Rust 创建会话响应失败", zap.Error(err))
+		return
+	}
+	if strings.TrimSpace(conv.ID) == "" {
+		return
+	}
+	if _, err := h.db.GetConversationLite(conv.ID); err == nil {
+		return
+	}
+	meta := database.ConversationCreateMeta{Source: "rustapi_bridge", ProjectID: strings.TrimSpace(conv.ProjectID)}
+	title := strings.TrimSpace(conv.Title)
+	if title == "" {
+		title = "New Chat"
+	}
+	if _, err := h.db.CreateConversationWithID(conv.ID, "", title, meta); err != nil {
+		h.log().Warn("桥接 Rust 会话到本地 SQLite 失败", zap.String("conversationId", conv.ID), zap.Error(err))
+	}
+	_ = ctx
 }
 
 // DeleteTurnRequest 删除一轮对话（POST /api/conversations/:id/delete-turn）

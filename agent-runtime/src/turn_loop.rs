@@ -1,17 +1,23 @@
+use std::collections::HashSet;
+
 use serde_json::{Map, Value};
 
 use crate::cancellation::CancelToken;
 use crate::compaction::{CompactionArtifact, CompactionRuntime};
-use crate::event_protocol::RuntimeEvent;
+use crate::event_protocol::{new_id, RuntimeEvent};
 use crate::filesystem_runtime::FilesystemRuntime;
 use crate::knowledge_runtime::KnowledgeRuntime;
 use crate::mcp_bridge::McpBridge;
-use crate::model_stream::{ChatMessage, ModelConfig, ModelDelta, ModelStream};
-use crate::permission::{PermissionDecision, PermissionPolicy};
+use crate::mcp_registry::{
+    BudgetConfig, CompactCatalog, McpBudgetPreferences, McpLoadedTools, McpToolRegistry,
+    SchemaBudgetReport,
+};
+use crate::model_stream::{ChatMessage, ModelConfig, ModelDelta, ModelStream, ModelToolCall};
+use crate::permission::{PermissionAction, PermissionPolicy, PermissionReply};
 use crate::plan_store::PlanStore;
 use crate::session_store::{SessionStore, StoredCompactionArtifactRef, StoredPendingApproval};
 use crate::skill_runtime::SkillRuntime;
-use crate::tool_registry::{ToolExecutionContext, ToolInvocation, ToolRegistry};
+use crate::tool_registry::{ToolExecutionContext, ToolRegistry};
 use crate::tool_runtime::ToolOutcome;
 
 #[derive(Debug)]
@@ -22,6 +28,7 @@ pub struct TurnLoop {
     plan: PlanStore,
     tool_result_waiting_for_follow_up: bool,
     max_steps: usize,
+    rejected_permission_signatures: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -29,6 +36,12 @@ pub struct TurnRunResult {
     pub events: Vec<RuntimeEvent>,
     pub pending_approval: Option<StoredPendingApproval>,
     pub compaction_artifacts: Vec<StoredCompactionArtifactRef>,
+}
+
+enum PermissionGateOutcome {
+    Allow(ModelToolCall),
+    Rejected,
+    LegacyPending(StoredPendingApproval),
 }
 
 impl TurnRunResult {
@@ -73,6 +86,7 @@ impl TurnLoop {
             plan: PlanStore::default(),
             tool_result_waiting_for_follow_up: false,
             max_steps: 100,
+            rejected_permission_signatures: HashSet::new(),
         }
     }
 
@@ -102,20 +116,33 @@ impl TurnLoop {
 
         let skills = SkillRuntime::from_context(&context);
         let mcp = McpBridge::from_context(&context);
+        let mcp_registry = McpToolRegistry::from_context(&context);
+        let session_store = SessionStore::from_context(&context);
+        let mut mcp_loaded =
+            self.restore_mcp_loaded_tools(&session_store, &mcp_registry, &mut events, on_event);
+        let mcp_catalog = mcp_registry.compact_catalog();
+        let mcp_budget = BudgetConfig::from_context(&context);
         let knowledge = KnowledgeRuntime::from_context(&context);
         let filesystem = FilesystemRuntime::from_context(&context);
-        let registry = ToolRegistry::from_capabilities(&mcp, &filesystem);
-        let model =
-            ModelStream::new(ModelConfig::from_context(&context)).with_tools(registry.schemas());
+        let model = ModelStream::new(ModelConfig::from_context(&context));
         let permission = PermissionPolicy::from_context(&context);
         let mut compaction = CompactionRuntime::from_context(&context);
-        let session_store = SessionStore::from_context(&context);
         let mut messages = vec![ChatMessage::system(runtime_system_prompt(
             &skills,
-            &mcp,
+            &mcp_registry,
+            &mcp_catalog,
             &knowledge,
             &filesystem,
         ))];
+        emit_event(
+            &mut events,
+            on_event,
+            self.runtime_status_update(format!(
+                "Rust MCP registry loaded role-filtered catalog: {} tools; restored MCP loaded-state records: {}.",
+                mcp_catalog.count,
+                mcp_loaded.snapshot().records.len()
+            )),
+        );
         let mut compaction_artifacts = Vec::new();
         messages.extend(history_messages_from_context(&context));
         messages.push(ChatMessage::user(message.clone()));
@@ -199,13 +226,61 @@ impl TurnLoop {
 
             let sampled_after_tool_result = self.tool_result_waiting_for_follow_up;
             let mut streamed_reasoning = String::new();
+            let mut streamed_content = String::new();
+            let stream_assistant_content =
+                sampled_after_tool_result && !self.plan.has_active_work();
+            let (registry, request_model, budget_report) = self.prepare_model_request(
+                &model,
+                &mcp_registry,
+                &mut mcp_loaded,
+                &filesystem,
+                &messages,
+                &mcp_catalog,
+                &mcp_budget,
+                &context,
+            );
+            self.persist_mcp_loaded_tools(&session_store, &mcp_loaded, &mut events, on_event);
+            emit_event(
+                &mut events,
+                on_event,
+                self.runtime_status_update(schema_budget_status(&budget_report)),
+            );
+            if !budget_report.overloaded_selected_tools.is_empty() {
+                let overloaded = budget_report.overloaded_selected_tools.join(", ");
+                emit_event(
+                    &mut events,
+                    on_event,
+                    self.runtime_status_update(format!(
+                        "已选择的 MCP 工具 schema 当前无法装入上下文预算：{}。请先压缩历史或改选更小工具。",
+                        overloaded
+                    )),
+                );
+            }
+            if add_mcp_budget_block_system_message(&mut messages, &budget_report) {
+                emit_event(
+                    &mut events,
+                    on_event,
+                    self.follow_up_started("mcp selected tool schema budget blocked"),
+                );
+                continue;
+            }
             emit_event(
                 &mut events,
                 on_event,
                 self.runtime_status_update(progress_sampling_message(sampled_after_tool_result)),
             );
-            let turn = match model.sample_with_deltas(&messages, |delta| match delta {
-                ModelDelta::Content(_) => {}
+            let turn = match request_model.sample_with_deltas(&messages, |delta| match delta {
+                ModelDelta::Content(delta) => {
+                    if stream_assistant_content {
+                        streamed_content.push_str(&delta);
+                        final_response_streamed = true;
+                        emit_event(
+                            &mut events,
+                            on_event,
+                            self.assistant_delta(delta, &streamed_content),
+                        );
+                    }
+                }
                 ModelDelta::Reasoning(delta) => {
                     streamed_reasoning.push_str(&delta);
                     emit_event(&mut events, on_event, self.reasoning_delta(delta));
@@ -290,66 +365,34 @@ impl TurnLoop {
                     }
                     let args =
                         serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-                    let (invocation, decision) =
-                        self.evaluate_tool_permission(&call, &registry, &permission);
-                    match decision {
-                        PermissionDecision::Allow => {}
-                        PermissionDecision::Deny => {
-                            let error = format!(
-                                "tool denied by permission policy: {}",
-                                invocation.permission_name
-                            );
-                            emit_event(
-                                &mut events,
-                                on_event,
-                                self.tool_failed(&call.id, &invocation.display_name, error.clone()),
-                            );
-                            emit_event(&mut events, on_event, self.turn_aborted(error));
-                            return TurnRunResult::with_compactions(events, compaction_artifacts);
-                        }
-                        PermissionDecision::RequireApproval => {
-                            let request_id = format!("approval_{}", call.id);
-                            emit_event(
-                                &mut events,
-                                on_event,
-                                self.runtime_status_update(format!(
-                                    "工具 {} 需要人工审批，已暂停等待处理。",
-                                    invocation.display_name
-                                )),
-                            );
-                            emit_event(
-                                &mut events,
-                                on_event,
-                                self.approval_requested(
-                                    &request_id,
-                                    &invocation.permission_name,
-                                    &call.id,
-                                    &invocation.display_name,
-                                    args.clone(),
-                                    format!(
-                                        "Tool {} requires human approval before execution.",
-                                        invocation.display_name
-                                    ),
-                                ),
-                            );
-                            let pending = StoredPendingApproval {
-                                request_id,
-                                turn_id: self.turn_id.clone(),
-                                tool_call: call,
-                                messages,
-                                plan_items: self.plan.items(),
-                                context,
-                            };
+                    let call = match self.permission_gate(
+                        call,
+                        args.clone(),
+                        &registry,
+                        &permission,
+                        messages.clone(),
+                        &context,
+                        &mut messages,
+                        &mut events,
+                        on_event,
+                    ) {
+                        PermissionGateOutcome::Allow(call) => call,
+                        PermissionGateOutcome::Rejected => continue,
+                        PermissionGateOutcome::LegacyPending(pending) => {
                             return TurnRunResult::pending(events, pending, compaction_artifacts);
                         }
-                    }
+                    };
                     self.execute_tool_call(
                         &call,
                         &registry,
                         &skills,
                         &mcp,
+                        &mcp_registry,
+                        &mut mcp_loaded,
+                        &session_store,
                         &knowledge,
                         &filesystem,
+                        tool_timeout_seconds(&context),
                         &mut messages,
                         &mut events,
                         on_event,
@@ -377,15 +420,8 @@ impl TurnLoop {
             }
 
             final_response = turn.content;
-            final_response_streamed = turn.streamed_content;
-            if final_response_streamed {
-                self.emit_assistant_text_stream(
-                    &final_response,
-                    &mut final_response_streamed,
-                    &mut events,
-                    on_event,
-                );
-            }
+            final_response_streamed =
+                final_response_streamed || (stream_assistant_content && turn.streamed_content);
             if completion_gate_allows_turn_completed(
                 &self.plan,
                 self.tool_result_waiting_for_follow_up,
@@ -505,23 +541,51 @@ impl TurnLoop {
         }
         let skills = SkillRuntime::from_context(&context);
         let mcp = McpBridge::from_context(&context);
+        let mcp_registry = McpToolRegistry::from_context(&context);
+        let session_store = SessionStore::from_context(&context);
+        let mut mcp_loaded =
+            self.restore_mcp_loaded_tools(&session_store, &mcp_registry, &mut events, on_event);
+        if let Some(tool) = mcp_registry.find(&pending.tool_call.function.name) {
+            mcp_loaded.mark_selected(tool);
+        }
+        let mcp_catalog = mcp_registry.compact_catalog();
+        let mcp_budget = BudgetConfig::from_context(&context);
+        emit_event(
+            &mut events,
+            on_event,
+            self.runtime_status_update(format!(
+                "Rust MCP registry loaded role-filtered catalog: {} tools.",
+                mcp_catalog.count
+            )),
+        );
         let knowledge = KnowledgeRuntime::from_context(&context);
         let filesystem = FilesystemRuntime::from_context(&context);
-        let registry = ToolRegistry::from_capabilities(&mcp, &filesystem);
-        let model =
-            ModelStream::new(ModelConfig::from_context(&context)).with_tools(registry.schemas());
+        let model = ModelStream::new(ModelConfig::from_context(&context));
+        let mut messages = pending.messages;
+        let (registry, _, _) = self.prepare_model_request(
+            &model,
+            &mcp_registry,
+            &mut mcp_loaded,
+            &filesystem,
+            &messages,
+            &mcp_catalog,
+            &mcp_budget,
+            &context,
+        );
         let permission = PermissionPolicy::from_context(&context);
         let mut compaction = CompactionRuntime::from_context(&context);
-        let session_store = SessionStore::from_context(&context);
-        let mut messages = pending.messages;
         let mut compaction_artifacts = Vec::new();
         self.execute_tool_call(
             &pending.tool_call,
             &registry,
             &skills,
             &mcp,
+            &mcp_registry,
+            &mut mcp_loaded,
+            &session_store,
             &knowledge,
             &filesystem,
+            tool_timeout_seconds(&context),
             &mut messages,
             &mut events,
             on_event,
@@ -586,13 +650,61 @@ impl TurnLoop {
             }
             let sampled_after_tool_result = self.tool_result_waiting_for_follow_up;
             let mut streamed_reasoning = String::new();
+            let mut streamed_content = String::new();
+            let stream_assistant_content =
+                sampled_after_tool_result && !self.plan.has_active_work();
+            let (registry, request_model, budget_report) = self.prepare_model_request(
+                &model,
+                &mcp_registry,
+                &mut mcp_loaded,
+                &filesystem,
+                &messages,
+                &mcp_catalog,
+                &mcp_budget,
+                &context,
+            );
+            self.persist_mcp_loaded_tools(&session_store, &mcp_loaded, &mut events, on_event);
+            emit_event(
+                &mut events,
+                on_event,
+                self.runtime_status_update(schema_budget_status(&budget_report)),
+            );
+            if !budget_report.overloaded_selected_tools.is_empty() {
+                let overloaded = budget_report.overloaded_selected_tools.join(", ");
+                emit_event(
+                    &mut events,
+                    on_event,
+                    self.runtime_status_update(format!(
+                        "已选择的 MCP 工具 schema 当前无法装入上下文预算：{}。请先压缩历史或改选更小工具。",
+                        overloaded
+                    )),
+                );
+            }
+            if add_mcp_budget_block_system_message(&mut messages, &budget_report) {
+                emit_event(
+                    &mut events,
+                    on_event,
+                    self.follow_up_started("mcp selected tool schema budget blocked"),
+                );
+                continue;
+            }
             emit_event(
                 &mut events,
                 on_event,
                 self.runtime_status_update(progress_sampling_message(sampled_after_tool_result)),
             );
-            let turn = match model.sample_with_deltas(&messages, |delta| match delta {
-                ModelDelta::Content(_) => {}
+            let turn = match request_model.sample_with_deltas(&messages, |delta| match delta {
+                ModelDelta::Content(delta) => {
+                    if stream_assistant_content {
+                        streamed_content.push_str(&delta);
+                        final_response_streamed = true;
+                        emit_event(
+                            &mut events,
+                            on_event,
+                            self.assistant_delta(delta, &streamed_content),
+                        );
+                    }
+                }
                 ModelDelta::Reasoning(delta) => {
                     streamed_reasoning.push_str(&delta);
                     emit_event(&mut events, on_event, self.reasoning_delta(delta));
@@ -674,66 +786,34 @@ impl TurnLoop {
                     }
                     let args =
                         serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
-                    let (invocation, decision) =
-                        self.evaluate_tool_permission(&call, &registry, &permission);
-                    match decision {
-                        PermissionDecision::Allow => {}
-                        PermissionDecision::Deny => {
-                            let error = format!(
-                                "tool denied by permission policy: {}",
-                                invocation.permission_name
-                            );
-                            emit_event(
-                                &mut events,
-                                on_event,
-                                self.tool_failed(&call.id, &invocation.display_name, error.clone()),
-                            );
-                            emit_event(&mut events, on_event, self.turn_aborted(error));
-                            return TurnRunResult::with_compactions(events, compaction_artifacts);
-                        }
-                        PermissionDecision::RequireApproval => {
-                            let request_id = format!("approval_{}", call.id);
-                            emit_event(
-                                &mut events,
-                                on_event,
-                                self.runtime_status_update(format!(
-                                    "工具 {} 需要人工审批，已暂停等待处理。",
-                                    invocation.display_name
-                                )),
-                            );
-                            emit_event(
-                                &mut events,
-                                on_event,
-                                self.approval_requested(
-                                    &request_id,
-                                    &invocation.permission_name,
-                                    &call.id,
-                                    &invocation.display_name,
-                                    args.clone(),
-                                    format!(
-                                        "Tool {} requires human approval before execution.",
-                                        invocation.display_name
-                                    ),
-                                ),
-                            );
-                            let pending = StoredPendingApproval {
-                                request_id,
-                                turn_id: self.turn_id.clone(),
-                                tool_call: call,
-                                messages,
-                                plan_items: self.plan.items(),
-                                context,
-                            };
+                    let call = match self.permission_gate(
+                        call,
+                        args.clone(),
+                        &registry,
+                        &permission,
+                        messages.clone(),
+                        &context,
+                        &mut messages,
+                        &mut events,
+                        on_event,
+                    ) {
+                        PermissionGateOutcome::Allow(call) => call,
+                        PermissionGateOutcome::Rejected => continue,
+                        PermissionGateOutcome::LegacyPending(pending) => {
                             return TurnRunResult::pending(events, pending, compaction_artifacts);
                         }
-                    }
+                    };
                     self.execute_tool_call(
                         &call,
                         &registry,
                         &skills,
                         &mcp,
+                        &mcp_registry,
+                        &mut mcp_loaded,
+                        &session_store,
                         &knowledge,
                         &filesystem,
+                        tool_timeout_seconds(&context),
                         &mut messages,
                         &mut events,
                         on_event,
@@ -760,15 +840,8 @@ impl TurnLoop {
                 continue;
             }
             final_response = turn.content;
-            final_response_streamed = turn.streamed_content;
-            if final_response_streamed {
-                self.emit_assistant_text_stream(
-                    &final_response,
-                    &mut final_response_streamed,
-                    &mut events,
-                    on_event,
-                );
-            }
+            final_response_streamed =
+                final_response_streamed || (stream_assistant_content && turn.streamed_content);
             if completion_gate_allows_turn_completed(
                 &self.plan,
                 self.tool_result_waiting_for_follow_up,
@@ -829,14 +902,202 @@ impl TurnLoop {
         TurnRunResult::with_compactions(events, compaction_artifacts)
     }
 
+    fn permission_gate(
+        &mut self,
+        call: ModelToolCall,
+        args: Value,
+        registry: &ToolRegistry,
+        permission: &PermissionPolicy,
+        messages_snapshot: Vec<ChatMessage>,
+        context: &Map<String, Value>,
+        messages: &mut Vec<ChatMessage>,
+        events: &mut Vec<RuntimeEvent>,
+        on_event: &mut impl FnMut(RuntimeEvent),
+    ) -> PermissionGateOutcome {
+        let invocation = registry.invocation(&call);
+        let signature = permission_call_signature(&invocation.permission_name, &args);
+        match permission.action_for_invocation(&invocation) {
+            PermissionAction::Allow => PermissionGateOutcome::Allow(call),
+            PermissionAction::Deny => {
+                let denial = format!(
+                    "[HITL Reject] Tool '{}' was denied by permission policy. Permission: {}. Do not retry the same call unchanged; adjust the plan and continue without this exact tool call.",
+                    invocation.display_name, invocation.permission_name
+                );
+                self.record_rejected_tool_call(
+                    &call,
+                    &invocation.display_name,
+                    denial,
+                    messages,
+                    events,
+                    on_event,
+                );
+                PermissionGateOutcome::Rejected
+            }
+            PermissionAction::Ask => {
+                if self.rejected_permission_signatures.contains(&signature) {
+                    let denial = format!(
+                        "[HITL Reject] Tool '{}' was already rejected for the same arguments in this turn. Do not retry the same call unchanged; adjust the plan and continue without this exact tool call.",
+                        invocation.display_name
+                    );
+                    self.record_rejected_tool_call(
+                        &call,
+                        &invocation.display_name,
+                        denial,
+                        messages,
+                        events,
+                        on_event,
+                    );
+                    return PermissionGateOutcome::Rejected;
+                }
+                let request_id = new_id("approval");
+                emit_event(
+                    events,
+                    on_event,
+                    self.runtime_status_update(format!(
+                        "工具 {} 需要人工审批，已暂停等待处理。",
+                        invocation.display_name
+                    )),
+                );
+                emit_event(
+                    events,
+                    on_event,
+                    self.approval_requested(
+                        &request_id,
+                        &invocation.permission_name,
+                        &call.id,
+                        &invocation.display_name,
+                        args.clone(),
+                        format!(
+                            "Tool {} requires human approval before execution.",
+                            invocation.display_name
+                        ),
+                    ),
+                );
+                if !permission.has_rust_ask_endpoint() {
+                    return PermissionGateOutcome::LegacyPending(StoredPendingApproval {
+                        request_id,
+                        turn_id: self.turn_id.clone(),
+                        tool_call: call,
+                        messages: messages_snapshot,
+                        plan_items: self.plan.items(),
+                        context: context.clone(),
+                    });
+                }
+                let request = permission.build_request(
+                    &self.conversation_id,
+                    &self.runtime_session_id,
+                    &request_id,
+                    &invocation,
+                    &call.id,
+                    args,
+                );
+                match permission.ask(&request) {
+                    Ok(reply) => {
+                        emit_event(
+                            events,
+                            on_event,
+                            RuntimeEvent::ApprovalResolved {
+                                conversation_id: self.conversation_id.clone(),
+                                runtime_session_id: self.runtime_session_id.clone(),
+                                turn_id: self.turn_id.clone(),
+                                request_id,
+                                decision: if reply.reply == PermissionReply::Reject {
+                                    "reject".to_string()
+                                } else {
+                                    "approve".to_string()
+                                },
+                            },
+                        );
+                        match reply.reply {
+                            PermissionReply::Reject => {
+                                self.rejected_permission_signatures.insert(signature);
+                                let reason = if reply.comment.trim().is_empty() {
+                                    "human reviewer rejected this tool call".to_string()
+                                } else {
+                                    format!(
+                                        "human reviewer rejected this tool call: {}",
+                                        reply.comment.trim()
+                                    )
+                                };
+                                let denial = format!(
+                                    "[HITL Reject] Tool '{}' was rejected. Reason: {}. Do not execute this tool call; adjust parameters or continue with an alternate plan.",
+                                    invocation.display_name, reason
+                                );
+                                self.record_rejected_tool_call(
+                                    &call,
+                                    &invocation.display_name,
+                                    denial,
+                                    messages,
+                                    events,
+                                    on_event,
+                                );
+                                PermissionGateOutcome::Rejected
+                            }
+                            PermissionReply::Once | PermissionReply::Always => {
+                                let mut approved_call = call;
+                                if let Some(edited) = reply.edited_arguments {
+                                    approved_call.function.arguments = edited.to_string();
+                                }
+                                PermissionGateOutcome::Allow(approved_call)
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        self.rejected_permission_signatures.insert(signature);
+                        let denial = format!(
+                            "[HITL Reject] Tool '{}' could not obtain permission. Error: {}. Do not retry the same call unchanged; continue with a safe alternative or explain the block.",
+                            invocation.display_name, err
+                        );
+                        self.record_rejected_tool_call(
+                            &call,
+                            &invocation.display_name,
+                            denial,
+                            messages,
+                            events,
+                            on_event,
+                        );
+                        PermissionGateOutcome::Rejected
+                    }
+                }
+            }
+        }
+    }
+
+    fn record_rejected_tool_call(
+        &mut self,
+        call: &ModelToolCall,
+        tool_name: &str,
+        message: String,
+        messages: &mut Vec<ChatMessage>,
+        events: &mut Vec<RuntimeEvent>,
+        on_event: &mut impl FnMut(RuntimeEvent),
+    ) {
+        emit_event(
+            events,
+            on_event,
+            self.runtime_status_update("人工审批拒绝工具调用，已把拒绝原因返回给模型。"),
+        );
+        emit_event(
+            events,
+            on_event,
+            self.tool_failed(&call.id, tool_name, message.clone()),
+        );
+        messages.push(ChatMessage::tool(call.id.clone(), message));
+        self.tool_result_waiting_for_follow_up = true;
+    }
+
     fn execute_tool_call(
         &mut self,
-        call: &crate::model_stream::ModelToolCall,
+        call: &ModelToolCall,
         registry: &ToolRegistry,
         skills: &SkillRuntime,
         mcp: &McpBridge,
+        mcp_registry: &McpToolRegistry,
+        mcp_loaded: &mut McpLoadedTools,
+        session_store: &SessionStore,
         knowledge: &KnowledgeRuntime,
         filesystem: &FilesystemRuntime,
+        tool_timeout_seconds: u64,
         messages: &mut Vec<ChatMessage>,
         events: &mut Vec<RuntimeEvent>,
         on_event: &mut impl FnMut(RuntimeEvent),
@@ -862,8 +1123,11 @@ impl TurnLoop {
                 plan: &mut self.plan,
                 skills,
                 mcp,
+                mcp_registry,
+                mcp_loaded,
                 knowledge,
                 filesystem,
+                tool_timeout_seconds,
             };
             let mut emit_tool_delta = |delta: String| {
                 emit_event(
@@ -946,6 +1210,85 @@ impl TurnLoop {
             }
         }
         self.tool_result_waiting_for_follow_up = true;
+        self.persist_mcp_loaded_tools(session_store, mcp_loaded, events, on_event);
+    }
+
+    fn prepare_model_request(
+        &self,
+        model: &ModelStream,
+        mcp_registry: &McpToolRegistry,
+        mcp_loaded: &mut McpLoadedTools,
+        filesystem: &FilesystemRuntime,
+        messages: &[ChatMessage],
+        catalog: &CompactCatalog,
+        budget: &BudgetConfig,
+        context: &Map<String, Value>,
+    ) -> (ToolRegistry, ModelStream, SchemaBudgetReport) {
+        let preferences = McpBudgetPreferences::from_context(context, messages);
+        let loaded = mcp_registry.schemas_for_request(
+            messages,
+            mcp_loaded,
+            catalog.token_estimate,
+            budget,
+            &preferences,
+        );
+        let registry = ToolRegistry::from_capabilities(filesystem, &loaded.schemas);
+        let request_model = model.clone().with_tools(registry.schemas());
+        (registry, request_model, loaded.report)
+    }
+
+    fn restore_mcp_loaded_tools(
+        &self,
+        session_store: &SessionStore,
+        mcp_registry: &McpToolRegistry,
+        events: &mut Vec<RuntimeEvent>,
+        on_event: &mut impl FnMut(RuntimeEvent),
+    ) -> McpLoadedTools {
+        match session_store.load(&self.conversation_id, &self.runtime_session_id) {
+            Ok(Some(session)) => {
+                McpLoadedTools::from_records(mcp_registry, session.mcp_loaded_tools)
+            }
+            Ok(None) => McpLoadedTools::default(),
+            Err(err) => {
+                emit_event(
+                    events,
+                    on_event,
+                    self.runtime_error(format!("restore MCP loaded state: {}", err)),
+                );
+                McpLoadedTools::default()
+            }
+        }
+    }
+
+    fn persist_mcp_loaded_tools(
+        &self,
+        session_store: &SessionStore,
+        loaded: &McpLoadedTools,
+        events: &mut Vec<RuntimeEvent>,
+        on_event: &mut impl FnMut(RuntimeEvent),
+    ) {
+        let snapshot = loaded.snapshot();
+        let mut session = match session_store.load(&self.conversation_id, &self.runtime_session_id)
+        {
+            Ok(Some(session)) => session,
+            Ok(None) => return,
+            Err(err) => {
+                emit_event(
+                    events,
+                    on_event,
+                    self.runtime_error(format!("load session for MCP loaded state: {}", err)),
+                );
+                return;
+            }
+        };
+        session.set_mcp_loaded_tools(snapshot.records);
+        if let Err(err) = session_store.save(&session) {
+            emit_event(
+                events,
+                on_event,
+                self.runtime_error(format!("save MCP loaded state: {}", err)),
+            );
+        }
     }
 
     fn persist_compaction_artifact(
@@ -976,17 +1319,6 @@ impl TurnLoop {
                 String::new()
             }
         }
-    }
-
-    fn evaluate_tool_permission(
-        &self,
-        call: &crate::model_stream::ModelToolCall,
-        registry: &ToolRegistry,
-        permission: &PermissionPolicy,
-    ) -> (ToolInvocation, PermissionDecision) {
-        let invocation = registry.invocation(call);
-        let decision = permission.evaluate_invocation(&invocation);
-        (invocation, decision)
     }
 
     fn event_turn_started(&self) -> RuntimeEvent {
@@ -1240,9 +1572,64 @@ fn progress_tool_selection_message(tool_calls: &[crate::model_stream::ModelToolC
     }
 }
 
+fn schema_budget_status(report: &SchemaBudgetReport) -> String {
+    format!(
+        "MCP ToolSearch catalog/budget: context_window={}, messages_tokens={}, catalog_tokens={}, loaded_schema_tokens={}, schema_budget={}, output_reserve={}, safety_margin={}, loaded_mcp_tools=[{}], selected_pending_mcp_tools=[{}], budget_blocked_mcp_tools=[{}], dropped_unloaded_mcp_tools=[{}], available_tokens={}.",
+        report.context_window_tokens,
+        report.messages_tokens,
+        report.catalog_tokens,
+        report.already_loaded_schema_tokens,
+        report.tool_schema_budget,
+        report.output_reserve_tokens,
+        report.safety_margin_tokens,
+        report.loaded_tools.join(","),
+        report.selected_pending_tools.join(","),
+        report.budget_blocked_tools.join(","),
+        report.dropped_tools.join(","),
+        report.available_tokens
+    )
+}
+
+fn add_mcp_budget_block_system_message(
+    messages: &mut Vec<ChatMessage>,
+    report: &SchemaBudgetReport,
+) -> bool {
+    if report.budget_blocked_tools.is_empty() {
+        return false;
+    }
+    let tools = report.budget_blocked_tools.join(",");
+    let marker = format!("MCP_SCHEMA_BUDGET_BLOCKED: {tools}");
+    if messages.iter().any(|message| {
+        message.role == "system"
+            && message
+                .content
+                .as_deref()
+                .is_some_and(|content| content.contains(&marker))
+    }) {
+        return false;
+    }
+    messages.push(ChatMessage::system(format!(
+        "{marker}. The selected MCP tool schema is too large for the current context budget. It remains selected_pending and budget_blocked, but its full schema is not visible in this request. Do not guess parameters or call it yet. Compress history, reduce context, or select a smaller tool; if budget later recovers, the runtime will prioritize loading this selected tool."
+    )));
+    true
+}
+
+fn tool_timeout_seconds(context: &Map<String, Value>) -> u64 {
+    context
+        .get("tool_timeout_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or(120)
+        .max(1)
+}
+
+fn permission_call_signature(permission: &str, arguments: &Value) -> String {
+    format!("{}:{}", permission.trim(), arguments)
+}
+
 fn runtime_system_prompt(
     skills: &SkillRuntime,
-    mcp: &McpBridge,
+    mcp_registry: &McpToolRegistry,
+    mcp_catalog: &CompactCatalog,
     knowledge: &KnowledgeRuntime,
     filesystem: &FilesystemRuntime,
 ) -> String {
@@ -1252,10 +1639,13 @@ fn runtime_system_prompt(
     } else {
         format!("Available skills: {}.", skill_names.join(", "))
     };
-    let mcp_text = if mcp.enabled_tool_count() == 0 {
-        "No external MCP tools are currently enabled.".to_string()
+    let mcp_text = if mcp_registry.enabled_count() == 0 {
+        "No MCP tools are currently enabled for this role.".to_string()
     } else {
-        format!("Available MCP tools: {}.", mcp.tool_summaries().join("; "))
+        format!(
+            "Role-filtered MCP catalog count: {}.\n{}",
+            mcp_catalog.count, mcp_catalog.prompt
+        )
     };
     let knowledge_snippets = knowledge.context_snippets();
     let knowledge_text = if knowledge_snippets.is_empty() {
@@ -1380,6 +1770,10 @@ mod tests {
     use crate::plan_store::{PlanItem, PlanStatus};
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
     use std::thread;
 
     #[test]
@@ -1727,6 +2121,102 @@ mod tests {
             .any(|event| matches!(event, RuntimeEvent::ToolCallCompleted { tool_name, .. } if tool_name == "demo::lookup")));
     }
 
+    #[test]
+    fn rust_permission_ask_endpoint_approves_and_executes_tool_without_legacy_pending() {
+        let ask_endpoint = start_mock_permission_ask_server(
+            r#"{"ok":true,"action":"allow","reply":"once","resumed":true,"comment":"approved"}"#,
+        );
+        let mcp_endpoint = start_mock_mcp_server(
+            r#"{"jsonrpc":"2.0","id":"cyberstrike-agent-runtime-mcp-call","result":{"content":[{"type":"text","text":"demo lookup result"}]}}"#,
+        );
+        let mut context = Map::new();
+        context.insert("simulate_mcp".to_string(), Value::Bool(true));
+        context.insert("approval_enabled".to_string(), Value::Bool(true));
+        context.insert("mcp_enabled".to_string(), Value::Bool(true));
+        context.insert(
+            "hitl_permission_ask_url".to_string(),
+            Value::String(ask_endpoint),
+        );
+        context.insert("mcp_endpoint_url".to_string(), Value::String(mcp_endpoint));
+        context.insert(
+            "mcp_tools".to_string(),
+            serde_json::json!([
+                {"server": "demo", "name": "lookup", "enabled": true, "requires_approval": true}
+            ]),
+        );
+
+        let result = TurnLoop::new("c".to_string(), "s".to_string(), "t".to_string())
+            .run("lookup runtime".to_string(), context);
+
+        assert!(result.pending_approval.is_none());
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ApprovalRequested { permission, tool_name, .. }
+                if permission == "demo::lookup" && tool_name == "demo::lookup"
+        )));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ApprovalResolved { decision, .. } if decision == "approve"
+        )));
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallCompleted { tool_name, result, .. }
+                if tool_name == "demo::lookup" && result.contains("demo lookup result")
+        )));
+    }
+
+    #[test]
+    fn rust_permission_ask_endpoint_rejects_tool_and_returns_feedback_to_model() {
+        let ask_hits = Arc::new(AtomicUsize::new(0));
+        let ask_endpoint = start_mock_permission_ask_server_counting(
+            r#"{"ok":true,"action":"deny","reply":"reject","resumed":true,"comment":"blocked by reviewer"}"#,
+            ask_hits.clone(),
+        );
+        let mut context = Map::new();
+        context.insert("simulate_mcp".to_string(), Value::Bool(true));
+        context.insert("approval_enabled".to_string(), Value::Bool(true));
+        context.insert("mcp_enabled".to_string(), Value::Bool(true));
+        context.insert(
+            "hitl_permission_ask_url".to_string(),
+            Value::String(ask_endpoint),
+        );
+        context.insert(
+            "mcp_tools".to_string(),
+            serde_json::json!([
+                {"server": "demo", "name": "lookup", "enabled": true, "requires_approval": true}
+            ]),
+        );
+
+        let result = TurnLoop::new("c".to_string(), "s".to_string(), "t".to_string())
+            .run("lookup runtime".to_string(), context);
+
+        assert!(result.pending_approval.is_none());
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ApprovalResolved { decision, .. } if decision == "reject"
+        )));
+        assert_eq!(
+            result
+                .events
+                .iter()
+                .filter(|event| matches!(event, RuntimeEvent::ApprovalRequested { .. }))
+                .count(),
+            1
+        );
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallFailed { tool_name, error, .. }
+                if tool_name == "demo::lookup"
+                    && error.contains("[HITL Reject]")
+                    && error.contains("blocked by reviewer")
+        )));
+        assert!(!result.events.iter().any(|event| matches!(
+            event,
+            RuntimeEvent::ToolCallCompleted { tool_name, .. } if tool_name == "demo::lookup"
+        )));
+        assert_eq!(ask_hits.load(Ordering::SeqCst), 1);
+    }
+
     fn start_mock_mcp_server(response_body: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1742,6 +2232,39 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
         format!("http://{}/mcp", addr)
+    }
+
+    fn start_mock_permission_ask_server(response_body: &'static str) -> String {
+        start_mock_permission_ask_server_counting(response_body, Arc::new(AtomicUsize::new(0)))
+    }
+
+    fn start_mock_permission_ask_server_counting(
+        response_body: &'static str,
+        hits: Arc<AtomicUsize>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            hits.fetch_add(1, Ordering::SeqCst);
+            let mut buffer = [0_u8; 8192];
+            let bytes = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..bytes]);
+            assert!(request.contains("POST /permission-ask HTTP/1.1"));
+            assert!(request.contains("\"conversationId\":\"c\""));
+            assert!(request.contains("\"sessionId\":\"s\""));
+            assert!(request.contains("\"toolName\":\"demo::lookup\""));
+            assert!(request.contains("\"permission\":\"demo::lookup\""));
+            assert!(request.contains("\"patterns\""));
+            assert!(request.contains("\"timeoutSeconds\""));
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        format!("http://{}/permission-ask", addr)
     }
 
     #[test]
@@ -1890,7 +2413,7 @@ mod tests {
 
         let first_delta = sink_events
             .iter()
-            .position(|event| matches!(event, RuntimeEvent::AssistantDelta { accumulated, .. } if accumulated == "hello stream"))
+            .position(|event| matches!(event, RuntimeEvent::AssistantDelta { accumulated, .. } if accumulated == "hello"))
             .unwrap();
         let completed = sink_events
             .iter()
@@ -1902,7 +2425,7 @@ mod tests {
                 .iter()
                 .filter(|event| matches!(event, RuntimeEvent::AssistantDelta { .. }))
                 .count(),
-            1
+            2
         );
         assert!(matches!(
             result.events.last(),
@@ -2144,9 +2667,12 @@ mod tests {
             "workspace_root".to_string(),
             Value::String(root.to_string_lossy().to_string()),
         );
+        let mcp_registry = McpToolRegistry::from_context(&Map::new());
+        let mcp_catalog = mcp_registry.compact_catalog();
         let prompt = runtime_system_prompt(
             &SkillRuntime::default(),
-            &McpBridge::from_context(&Map::new()),
+            &mcp_registry,
+            &mcp_catalog,
             &KnowledgeRuntime::from_context(&Map::new()),
             &FilesystemRuntime::from_context(&fs_context),
         );

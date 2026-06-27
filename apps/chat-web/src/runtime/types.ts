@@ -78,7 +78,7 @@ export type RuntimeAction =
   | ({ type: "assistant_delta"; delta: string; accumulated?: string } & ScopedRunAction)
   | ({ type: "reasoning_delta"; delta: string; accumulated?: string } & ScopedRunAction)
   | ({ type: "progress_update"; update: ProgressUpdate } & ScopedRunAction)
-  | ({ type: "plan"; items: PlanItem[] } & ScopedRunAction)
+  | ({ type: "plan"; items: PlanItem[]; conversationId?: string; status?: TurnRun["status"] } & ScopedRunAction)
   | ({ type: "tool"; tool: ToolRun } & ScopedRunAction)
   | ({ type: "tool_delta"; toolId: string; delta: string } & ScopedRunAction)
   | ({ type: "approval"; approval: ApprovalRequest } & ScopedRunAction)

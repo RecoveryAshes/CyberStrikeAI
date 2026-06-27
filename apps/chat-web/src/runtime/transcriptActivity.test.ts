@@ -137,6 +137,28 @@ test("final answer does not clear assistant progress updates", () => {
   );
 });
 
+test("turn completed response fills assistant text when deltas were missed", () => {
+  let state = startRun("run-1", "short answer");
+
+  state = applyEvents(state, [
+    {
+      type: "turn_completed",
+      message: "alpha：首位\nbeta：测试版\ngamma：伽马",
+      data: {
+        conversationId: "conv-1",
+        runtimeEventType: "turn_completed",
+        runtimeTrace: {
+          type: "turn_completed",
+          response: "alpha：首位\nbeta：测试版\ngamma：伽马"
+        }
+      }
+    }
+  ]);
+
+  assert.equal(state.activeRun?.status, "completed");
+  assert.equal(state.activeRun?.assistantText, "alpha：首位\nbeta：测试版\ngamma：伽马");
+});
+
 test("a second user turn does not mutate the first assistant message progress history", () => {
   let state = startRun("run-1", "first");
   state = applyEvents(state, [
@@ -548,6 +570,100 @@ test("markdown checklist planning messages hydrate todo plan items", () => {
     state.activeRun!.plan.map((item) => item.status),
     ["completed", "in_progress", "pending"]
   );
+});
+
+test("todo_updated events hydrate persisted todo plan items", () => {
+  let state = startRun("run-1", "inspect processes");
+  state = applyEvents(state, [
+    {
+      type: "todo_updated",
+      data: {
+        conversationId: "conv-1",
+        todos: [
+          { itemId: "todo-1", content: "读取进程列表", status: "completed", position: 0 },
+          { itemId: "todo-2", content: "判断 CPU 最高进程", status: "in_progress", position: 1 }
+        ]
+      }
+    }
+  ]);
+
+  assert.equal(todoProgress(state.activeRun!.plan)?.total, 2);
+  assert.equal(state.activeRun!.plan[0].id, "todo-1");
+  assert.equal(state.activeRun!.plan[1].status, "in_progress");
+});
+
+test("todo_updated does not pollute another conversation run body", () => {
+  let state = startRun("run-a", "first", initialRuntimeState, "conv-a");
+  state = runtimeReducer(state, {
+    type: "start",
+    id: "run-b",
+    conversationId: "conv-b",
+    message: "second",
+    startedAt: "2026-06-23T09:00:00.000Z"
+  });
+
+  state = applyGlobalTaskEvent(state, "conv-a", {
+    type: "todo_updated",
+    data: {
+      conversationId: "conv-a",
+      todos: [{ itemId: "todo-a", content: "A todo", status: "in_progress", position: 0 }]
+    }
+  });
+
+  assert.equal(state.runs.find((run) => run.conversationId === "conv-a")?.plan[0]?.content, "A todo");
+  assert.equal(state.runs.find((run) => run.conversationId === "conv-b")?.plan.length, 0);
+  assert.equal(state.runs.find((run) => run.conversationId === "conv-b")?.assistantText, "");
+});
+
+test("completed task todo snapshot restores without active task", () => {
+  let state = initialRuntimeState;
+  state = runtimeReducer(state, {
+    type: "plan",
+    conversationId: "conv-done",
+    status: "completed",
+    items: [{ id: "todo-1", content: "总结结果", status: "completed" }]
+  });
+
+  const run = state.runs.find((item) => item.conversationId === "conv-done");
+  assert.equal(run?.status, "completed");
+  assert.equal(todoProgress(run!.plan)?.completed, 1);
+});
+
+test("completed task can retain restored todo plan", () => {
+  let state = runtimeReducer(initialRuntimeState, {
+    type: "ensure_run",
+    conversationId: "conv-done",
+    message: "run task",
+    startedAt: "2026-06-23T09:00:00.000Z",
+    origin: "task"
+  });
+  const runId = state.runs.find((item) => item.conversationId === "conv-done")?.id;
+  state = runtimeReducer(state, {
+    type: "finish",
+    runId,
+    status: "completed"
+  });
+  state = runtimeReducer(state, {
+    type: "plan",
+    conversationId: "conv-done",
+    status: "completed",
+    items: [{ id: "todo-1", content: "保留 Todo", status: "completed" }]
+  });
+
+  const run = state.runs.find((item) => item.conversationId === "conv-done");
+  assert.equal(run?.status, "completed");
+  assert.equal(run?.plan[0]?.content, "保留 Todo");
+});
+
+test("conversation without todos does not create an empty todo dock run", () => {
+  const state = runtimeReducer(initialRuntimeState, {
+    type: "plan",
+    conversationId: "conv-empty",
+    status: "completed",
+    items: []
+  });
+
+  assert.equal(state.runs.find((item) => item.conversationId === "conv-empty"), undefined);
 });
 
 test("update_plan and todowrite tools are not rendered as tool activity parts", () => {

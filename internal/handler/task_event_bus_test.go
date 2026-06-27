@@ -39,6 +39,24 @@ func TestTaskEventBusCloseConversationDoesNotCloseGlobalSubscriber(t *testing.T)
 	}
 }
 
+func TestTaskEventBusPersistHookGetsConversationIDInjectedLine(t *testing.T) {
+	bus := NewTaskEventBus()
+	persisted := make(chan []byte, 1)
+	bus.SetPersistHook(func(conversationID string, line []byte) {
+		if conversationID != "conv-a" {
+			t.Errorf("conversationID = %q, want conv-a", conversationID)
+		}
+		persisted <- line
+	})
+
+	bus.Publish("conv-a", []byte(`data: {"type":"progress","message":"a"}`+"\n\n"))
+
+	line := readTaskEventLine(t, persisted)
+	if got := taskEventConversationID(t, line); got != "conv-a" {
+		t.Fatalf("expected persisted line to include conversationId conv-a, got %q in %s", got, line)
+	}
+}
+
 func readTaskEventLine(t *testing.T, ch <-chan []byte) []byte {
 	t.Helper()
 	select {

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::compaction::CompactionArtifact;
+use crate::mcp_registry::LoadedToolRecord;
 use crate::model_stream::{ChatMessage, ModelToolCall};
 use crate::plan_store::PlanItem;
 
@@ -29,6 +30,8 @@ pub struct StoredSession {
     pub compaction_artifacts: Vec<StoredCompactionArtifactRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compaction_tasks: Vec<StoredCompactionTask>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_loaded_tools: Vec<LoadedToolRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,6 +303,7 @@ impl StoredSession {
             pending_approval: None,
             compaction_artifacts: Vec::new(),
             compaction_tasks: Vec::new(),
+            mcp_loaded_tools: Vec::new(),
         }
     }
 
@@ -344,6 +348,11 @@ impl StoredSession {
             });
         }
         self.compaction_artifacts.append(&mut artifacts);
+        self.updated_at_unix = now_unix();
+    }
+
+    pub fn set_mcp_loaded_tools(&mut self, records: Vec<LoadedToolRecord>) {
+        self.mcp_loaded_tools = records;
         self.updated_at_unix = now_unix();
     }
 }
@@ -446,6 +455,38 @@ mod tests {
         assert_eq!(loaded.runtime_session_id, "session:1");
         assert_eq!(loaded.turn_count, 1);
         assert_eq!(loaded.state_summary, "completed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saves_and_loads_mcp_loaded_state() {
+        let root = std::env::temp_dir().join(format!(
+            "cyberstrike-session-mcp-loaded-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let mut context = Map::new();
+        context.insert(
+            "session_store_dir".to_string(),
+            json!(root.to_string_lossy().to_string()),
+        );
+        let store = SessionStore::from_context(&context);
+        let mut session = StoredSession::new("conv/1".to_string(), "session:1".to_string());
+        session.set_mcp_loaded_tools(vec![LoadedToolRecord {
+            identity: "builtin::nmap".to_string(),
+            state: crate::mcp_registry::LoadedToolStatus::BudgetBlocked,
+            selected_at: 10,
+            last_used_at: 11,
+            used_count: 2,
+            schema_hash: "hash".to_string(),
+        }]);
+        store.save(&session).unwrap();
+
+        let loaded = store.load("conv/1", "session:1").unwrap().unwrap();
+
+        assert_eq!(loaded.mcp_loaded_tools.len(), 1);
+        assert_eq!(loaded.mcp_loaded_tools[0].identity, "builtin::nmap");
+        assert_eq!(loaded.mcp_loaded_tools[0].used_count, 2);
         let _ = fs::remove_dir_all(&root);
     }
 

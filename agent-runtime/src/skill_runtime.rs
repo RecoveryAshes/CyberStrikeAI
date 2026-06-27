@@ -85,27 +85,33 @@ impl From<SkillError> for crate::tool_runtime::ToolError {
 impl SkillRuntime {
     pub fn from_context(context: &Map<String, Value>) -> Self {
         let mut skills = HashMap::new();
-        if let Some(obj) = context.get("skills").and_then(Value::as_object) {
-            for (name, value) in obj {
-                let name = name.trim();
-                if name.is_empty() {
-                    continue;
-                }
-                if let Some(content) = value.as_str() {
-                    skills.insert(
-                        name.to_string(),
-                        SkillPackage {
-                            name: name.to_string(),
-                            content: content.to_string(),
-                            ..SkillPackage::default()
-                        },
-                    );
-                    continue;
-                }
-                if let Some(obj) = value.as_object() {
-                    skills.insert(name.to_string(), parse_skill_package(name, obj));
-                }
+        let skills_enabled = context
+            .get("skills_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !skills_enabled {
+            return Self { skills };
+        }
+        let skills_source = context
+            .get("skills_source")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default();
+        let mut attempted_dir_load = false;
+        if skills_enabled && skills_source != "go_context" {
+            if let Some(root) = context
+                .get("skills_dir")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                attempted_dir_load = true;
+                let allowlist = parse_skills_allowlist(context);
+                load_skill_packages_from_dir(Path::new(root), &allowlist, &mut skills);
             }
+        }
+        if skills_source == "go_context" || (!attempted_dir_load && skills.is_empty()) {
+            load_skill_packages_from_context(context, &mut skills);
         }
         Self { skills }
     }
@@ -346,6 +352,163 @@ impl SkillPackage {
             limit,
         ))
     }
+}
+
+fn load_skill_packages_from_context(
+    context: &Map<String, Value>,
+    skills: &mut HashMap<String, SkillPackage>,
+) {
+    if let Some(obj) = context.get("skills").and_then(Value::as_object) {
+        for (name, value) in obj {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            if let Some(content) = value.as_str() {
+                skills.insert(
+                    name.to_string(),
+                    SkillPackage {
+                        name: name.to_string(),
+                        content: content.to_string(),
+                        ..SkillPackage::default()
+                    },
+                );
+                continue;
+            }
+            if let Some(obj) = value.as_object() {
+                skills.insert(name.to_string(), parse_skill_package(name, obj));
+            }
+        }
+    }
+}
+
+fn parse_skills_allowlist(context: &Map<String, Value>) -> Option<Vec<String>> {
+    let items = context.get("skills_allowlist")?.as_array()?;
+    let mut out = Vec::new();
+    for item in items {
+        let Some(value) = item
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        out.push(value.to_lowercase());
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+fn load_skill_packages_from_dir(
+    skills_root: &Path,
+    allowlist: &Option<Vec<String>>,
+    skills: &mut HashMap<String, SkillPackage>,
+) {
+    let Ok(entries) = fs::read_dir(skills_root) else {
+        return;
+    };
+    let mut entries = entries.filter_map(Result::ok).collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        if dir_name.starts_with('.') {
+            continue;
+        }
+        if let Some(allowlist) = allowlist {
+            let lower = dir_name.to_lowercase();
+            if !allowlist.iter().any(|item| item == &lower) {
+                continue;
+            }
+        }
+        if let Some(package) = load_skill_package_from_dir(&entry.path(), &dir_name) {
+            skills.insert(dir_name, package);
+        }
+    }
+}
+
+fn load_skill_package_from_dir(skill_dir: &Path, dir_name: &str) -> Option<SkillPackage> {
+    let base_dir = skill_dir.canonicalize().ok()?;
+    let raw = fs::read_to_string(base_dir.join("SKILL.md")).ok()?;
+    let parsed = parse_skill_markdown(&raw)?;
+    let name = if parsed.name.trim().is_empty() {
+        dir_name.to_string()
+    } else {
+        parsed.name
+    };
+    Some(SkillPackage {
+        name,
+        description: parsed.description,
+        content: parsed.body,
+        base_dir: base_dir.to_string_lossy().to_string(),
+        files: list_package_files(&base_dir, DEFAULT_FILE_LIST_LIMIT).unwrap_or_default(),
+        resources: HashMap::new(),
+    })
+}
+
+#[derive(Debug, Clone, Default)]
+struct ParsedSkillMarkdown {
+    name: String,
+    description: String,
+    body: String,
+}
+
+fn parse_skill_markdown(raw: &str) -> Option<ParsedSkillMarkdown> {
+    let text = raw.trim_start_matches('\u{feff}');
+    let mut lines = text.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    let mut frontmatter = Vec::new();
+    let mut body = Vec::new();
+    let mut in_frontmatter = true;
+    for line in lines {
+        if in_frontmatter {
+            if line.trim() == "---" {
+                in_frontmatter = false;
+                continue;
+            }
+            frontmatter.push(line);
+        } else {
+            body.push(line);
+        }
+    }
+    if in_frontmatter {
+        return None;
+    }
+    let mut parsed = ParsedSkillMarkdown {
+        body: body.join("\n").trim().to_string(),
+        ..ParsedSkillMarkdown::default()
+    };
+    for line in frontmatter {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = trim_yaml_scalar(value);
+        match key.trim() {
+            "name" => parsed.name = value,
+            "description" => parsed.description = value,
+            _ => {}
+        }
+    }
+    Some(parsed)
+}
+
+fn trim_yaml_scalar(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string()
 }
 
 fn parse_skill_package(name: &str, obj: &Map<String, Value>) -> SkillPackage {
@@ -901,6 +1064,93 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, SkillError::InvalidPath(_)));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scans_skill_packages_from_skills_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "cyberstrike-skill-runtime-dir-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let skill_dir = root.join("demo");
+        std::fs::create_dir_all(skill_dir.join("references")).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill\n---\nUse references/guide.md when needed.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            skill_dir.join("references").join("guide.md"),
+            "Guide body from scanned package",
+        )
+        .unwrap();
+        let mut context = Map::new();
+        context.insert("skills_enabled".to_string(), json!(true));
+        context.insert(
+            "skills_dir".to_string(),
+            json!(root.to_string_lossy().to_string()),
+        );
+
+        let runtime = SkillRuntime::from_context(&context);
+        assert_eq!(runtime.selected_skills(), vec!["demo".to_string()]);
+        let result = runtime
+            .execute_call(
+                r#"{"name":"demo","resources":["references/guide.md"],"file_pattern":"guide"}"#,
+            )
+            .unwrap();
+
+        assert!(result.contains("Use references/guide.md"));
+        assert!(result.contains("Demo skill"));
+        assert!(result.contains("Guide body from scanned package"));
+        assert!(result.contains("\"source\":\"filesystem\""));
+        let err = runtime
+            .execute_call(r#"{"name":"demo","resources":["../secret.txt"]}"#)
+            .unwrap_err();
+        assert!(matches!(err, SkillError::InvalidPath(_)));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scans_skill_packages_with_allowlist() {
+        let root = std::env::temp_dir().join(format!(
+            "cyberstrike-skill-runtime-allowlist-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["demo", "other"] {
+            let skill_dir = root.join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {name}\n---\n{name} body\n"),
+            )
+            .unwrap();
+        }
+        let mut context = Map::new();
+        context.insert("skills_enabled".to_string(), json!(true));
+        context.insert(
+            "skills_dir".to_string(),
+            json!(root.to_string_lossy().to_string()),
+        );
+        context.insert("skills_allowlist".to_string(), json!(["demo"]));
+
+        let runtime = SkillRuntime::from_context(&context);
+        assert_eq!(runtime.selected_skills(), vec!["demo".to_string()]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skills_enabled_false_disables_directory_and_context_skills() {
+        let mut context = Map::new();
+        context.insert("skills_enabled".to_string(), json!(false));
+        context.insert(
+            "skills".to_string(),
+            json!({"demo": "Use this demo skill instruction."}),
+        );
+
+        let runtime = SkillRuntime::from_context(&context);
+        assert!(runtime.selected_skills().is_empty());
     }
 
     #[test]

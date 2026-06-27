@@ -18,16 +18,17 @@ server:
   # --- 可选：HTTPS + HTTP/2（缓解浏览器对同源 HTTP/1.1 的并发连接数限制，多路 Deep 流式更稳）---
   # 启用 TLS 的条件（满足其一即可）：tls_enabled: true，或 tls_auto_self_sign: true，或同时配置了 tls_cert_path + tls_key_path。
   # 启用后请用 https://127.0.0.1:<本端口>/ 访问；若仍用 http:// 访问同端口，将自动 308 跳转到 HTTPS（可用 tls_http_redirect: false 关闭）。
-  tls_enabled: true
+  tls_enabled: false
   # 启用 HTTPS 时，明文 HTTP 是否自动跳转到 HTTPS（默认 true；同端口嗅探 TLS/HTTP 后分流）
-  # tls_http_redirect: true
+  tls_http_redirect: false
   # 方式 A（推荐生产）：PEM 证书与私钥路径
   # tls_cert_path: /path/to/fullchain.pem
   # tls_key_path: /path/to/privkey.pem
   # 方式 B（仅本地/测试）：无证书文件时内存自签（浏览器会提示不受信任；SAN 含 localhost / 127.0.0.1）
-  tls_auto_self_sign: true
+  tls_auto_self_sign: false
 # 认证配置
 auth:
+  disabled: true
   password:  # Web 登录密码，请修改为强密码
   session_duration_hours: 12 # 登录有效期（小时），超时后需重新登录
 # 日志配置
@@ -105,7 +106,7 @@ hitl:
 # Deep / Plan-Execute / Supervisor 由对话页与 WebShell 所选模式在请求体 orchestration 中指定；机器人按 robot_default_agent_mode
 multi_agent:
   enabled: true
-  robot_default_agent_mode: eino_single # 企微/钉钉/飞书机器人默认：eino_single | deep | plan_execute | supervisor
+  robot_default_agent_mode: eino_single # 企微/钉钉/飞书机器人默认：eino_single | agent_runtime | deep | plan_execute | supervisor
   batch_use_multi_agent: false # true 时「批量任务」队列中每个子任务也走 Eino 多代理（成本更高）
   # plan_execute 专用：execute↔replan 外层循环上限，0 表示 Eino 默认 10。主/子代理 ReAct 轮次见 agent.max_iterations。
   plan_execute_loop_max_iterations: 0
@@ -162,6 +163,28 @@ multi_agent:
       exporter: stdout # none | stdout（开发/本机）| otlphttp（生产接 Collector）
       otlp_endpoint: localhost:4318 # otlphttp 时使用，host:port，路径固定 /v1/traces
       sample_ratio: 1.0 # 0~1，ParentBased+TraceIDRatio
+# 独立 Agent Runtime（Rust RunLoop）
+agent_runtime:
+  enabled: true
+  binary_path: ./agent-runtime/target/release/cyberstrike-agent-runtime
+  transport: grpc # jsonl | grpc
+  grpc_listen: 127.0.0.1:0
+  redis_addr: 127.0.0.1:6379
+  redis_prefix: "csai:agent_runtime:"
+  workspace_root: ""
+  max_steps: 100
+  tool_timeout_seconds: 120
+  mcp_enabled: true
+  skills_enabled: true
+  knowledge_enabled: true
+  approval_enabled: true
+  compaction_enabled: true
+  compaction_threshold_chars: 40000
+  compaction_keep_recent_messages: 8
+# 独立 Rust HTTP API（由 Go /api 认证后反代）
+rust_api:
+  base_url: http://127.0.0.1:51283
+  timeout_seconds: 15
 # 数据库配置
 database:
   path: data/conversations.db # SQLite 数据库文件路径，用于存储对话历史和消息
@@ -191,7 +214,7 @@ security:
 # MCP 协议配置
 # MCP (Model Context Protocol) 用于工具注册和调用
 mcp:
-  enabled: false # 是否启用 MCP 服务器（http模式）
+  enabled: true # 是否启用 MCP 服务器（http模式）；Agent Runtime 调用内置工具需要开启
   host: 0.0.0.0 # MCP 服务器监听地址
   port: 8081 # MCP 服务器端口
   auth_header: "X-MCP-Token" # 鉴权：请求需携带该 header 且值与 auth_header_value 一致方可调用。留空表示不鉴权
@@ -313,4 +336,3 @@ project:
   fact_index_path_max_runes: 10000 
   fact_summary_max_runes: 24000
   default_inject_deprecated: false
-
