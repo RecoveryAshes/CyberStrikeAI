@@ -34,6 +34,9 @@ func TestOpenAPISpecIncludesAgentRuntimePathsAndBatchMode(t *testing.T) {
 	if _, ok := paths["/api/agent-runtime/stream"]; !ok {
 		t.Fatalf("/api/agent-runtime/stream missing from OpenAPI paths")
 	}
+	if _, ok := paths["/api/conversations/{id}/runtime-todos"]; !ok {
+		t.Fatalf("/api/conversations/{id}/runtime-todos missing from OpenAPI paths")
+	}
 
 	components := spec["components"].(map[string]interface{})
 	schemas := components["schemas"].(map[string]interface{})

@@ -166,6 +166,7 @@ impl SessionLoop {
                     stored_finished.append_compaction_artifacts(turn_result.compaction_artifacts);
                     stored_finished.mark_finished(last_turn_id, state_summary);
                 }
+                preserve_latest_mcp_loaded_tools(&store, &mut stored_finished);
                 if let Err(err) = store.save(&stored_finished) {
                     emit_event(
                         &mut events,
@@ -322,6 +323,7 @@ impl SessionLoop {
                     stored.pending_approval = None;
                 }
                 stored.append_compaction_artifacts(turn_result.compaction_artifacts);
+                preserve_latest_mcp_loaded_tools(&store, &mut stored);
                 {
                     let mut sessions = self.sessions.lock().expect("session loop poisoned");
                     let session =
@@ -421,6 +423,14 @@ fn claim_active_run(
     turn_id: &str,
 ) -> io::Result<ActiveRunGuard> {
     store.claim_active_run(conversation_id, runtime_session_id, turn_id)
+}
+
+fn preserve_latest_mcp_loaded_tools(store: &SessionStore, session: &mut StoredSession) {
+    if let Ok(Some(latest)) = store.load(&session.conversation_id, &session.runtime_session_id) {
+        if !latest.mcp_loaded_tools.is_empty() {
+            session.mcp_loaded_tools = latest.mcp_loaded_tools;
+        }
+    }
 }
 
 #[cfg(test)]

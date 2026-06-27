@@ -15,12 +15,10 @@ import (
 	"sync"
 	"time"
 
-	"cyberstrike-ai/internal/agents"
 	"cyberstrike-ai/internal/audit"
 	"cyberstrike-ai/internal/config"
 	"cyberstrike-ai/internal/knowledge"
 	"cyberstrike-ai/internal/mcp"
-	"cyberstrike-ai/internal/mcp/builtin"
 	"cyberstrike-ai/internal/openai"
 	"cyberstrike-ai/internal/security"
 
@@ -92,6 +90,7 @@ type ConfigHandler struct {
 	robotRestarter             RobotRestarter             // 机器人连接重启器（可选），ApplyConfig 时重启钉钉/飞书
 	audit                      *audit.Service
 	logger                     *zap.Logger
+	httpClient                 *http.Client
 	mu                         sync.RWMutex
 	lastEmbeddingConfig        *config.EmbeddingConfig // 上一次的嵌入模型配置（用于检测变更）
 }
@@ -129,6 +128,7 @@ func NewConfigHandler(configPath string, cfg *config.Config, mcpServer *mcp.Serv
 		attackChainHandler:  attackChainHandler,
 		externalMCPMgr:      externalMCPMgr,
 		logger:              logger,
+		httpClient:          http.DefaultClient,
 		lastEmbeddingConfig: lastEmbeddingConfig,
 	}
 }
@@ -264,93 +264,171 @@ type ToolConfigInfo struct {
 	InputSchema map[string]interface{} `json:"input_schema,omitempty"` // 工具参数 JSON Schema（用于前端展示详情）
 }
 
-// GetConfig 获取当前配置
+// GetConfig returns the 4177 chat-web frontend OpenAI settings from PostgreSQL.
 func (h *ConfigHandler) GetConfig(c *gin.Context) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	h.proxyConfigToRustAndWrite(c, "/api/config", "")
+}
 
-	// 获取工具列表（包含内部和外部工具）
-	// 首先从配置文件获取工具
-	configToolMap := make(map[string]bool)
-	tools := make([]ToolConfigInfo, 0, len(h.config.Security.Tools))
+// ListModels uses the PostgreSQL-backed frontend OpenAI settings to list models.
+func (h *ConfigHandler) ListModels(c *gin.Context) {
+	h.proxyConfigToRustAndWrite(c, "/api/config/list-models", "")
+}
 
-	for _, tool := range h.config.Security.Tools {
-		configToolMap[tool.Name] = true
-		info := ToolConfigInfo{
-			Name:        tool.Name,
-			Description: h.pickToolDescription(tool.ShortDescription, tool.Description),
-			Enabled:     tool.Enabled,
-			IsExternal:  false,
-		}
-		tools = append(tools, info)
+// UpdateConfig stores only the 4177 chat-web frontend OpenAI settings in PostgreSQL.
+func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
+	if !rewriteFrontendConfigUpdateBody(c) {
+		return
+	}
+	h.proxyConfigToRustAndWrite(c, "/api/config", "")
+}
+
+func rewriteFrontendConfigUpdateBody(c *gin.Context) bool {
+	raw, err := c.GetRawData()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "读取请求体失败: " + err.Error()})
+		return false
+	}
+	projected, err := projectFrontendConfigUpdateBody(raw)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求参数: " + err.Error()})
+		return false
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(projected))
+	c.Request.ContentLength = int64(len(projected))
+	if strings.TrimSpace(c.Request.Header.Get("Content-Type")) == "" {
+		c.Request.Header.Set("Content-Type", "application/json")
+	}
+	return true
+}
+
+func projectFrontendConfigUpdateBody(raw []byte) ([]byte, error) {
+	var payload map[string]interface{}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return nil, err
 	}
 
-	// 从MCP服务器获取所有已注册的工具（包括直接注册的工具，如知识检索工具）
-	if h.mcpServer != nil {
-		mcpTools := h.mcpServer.GetAllTools()
-		for _, mcpTool := range mcpTools {
-			if configToolMap[mcpTool.Name] {
-				continue
+	projected := make(map[string]interface{})
+	if openai, ok := payload["openai"].(map[string]interface{}); ok {
+		projectedOpenAI := make(map[string]interface{})
+		for _, key := range []string{"provider", "api_key", "base_url", "model"} {
+			if value, exists := openai[key]; exists {
+				projectedOpenAI[key] = value
 			}
-			description := h.pickToolDescription(mcpTool.ShortDescription, mcpTool.Description)
-			tools = append(tools, ToolConfigInfo{
-				Name:        mcpTool.Name,
-				Description: description,
-				Enabled:     true,
-				IsExternal:  false,
-			})
+		}
+		if reasoning, ok := openai["reasoning"].(map[string]interface{}); ok {
+			if effort, exists := reasoning["effort"]; exists {
+				projectedOpenAI["reasoning"] = map[string]interface{}{
+					"effort": effort,
+				}
+			}
+		}
+		if len(projectedOpenAI) > 0 {
+			projected["openai"] = projectedOpenAI
 		}
 	}
 
-	// 获取外部MCP工具（走缓存，持锁期间通常不阻塞）
-	if h.externalMCPMgr != nil {
-		ctx := context.Background()
-		externalTools := h.getExternalMCPTools(ctx)
-		for _, toolInfo := range externalTools {
-			tools = append(tools, toolInfo)
+	return json.Marshal(projected)
+}
+
+func (h *ConfigHandler) proxyConfigToRustAndWrite(c *gin.Context, path string, rawQuery string) {
+	if rawQuery == "" {
+		rawQuery = c.Request.URL.RawQuery
+	}
+	status, body, contentType, ok := proxyRequestToRust(c, h.httpClient, path, rawQuery, h.log(), "Rust API 配置/模型")
+	if !ok {
+		return
+	}
+	if path == "/api/config" && status >= http.StatusOK && status < http.StatusMultipleChoices {
+		if err := h.syncFrontendOpenAIConfigFromRust(body); err != nil {
+			h.log().Warn("同步 PostgreSQL 前端 OpenAI 配置到运行时失败", zap.Error(err))
 		}
 	}
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/json; charset=utf-8"
+	}
+	c.Data(status, contentType, body)
+}
 
-	subAgentCount := len(h.config.MultiAgent.SubAgents)
-	agentsDir := strings.TrimSpace(h.config.AgentsDir)
-	if agentsDir == "" {
-		agentsDir = "agents"
+func (h *ConfigHandler) log() *zap.Logger {
+	if h != nil && h.logger != nil {
+		return h.logger
 	}
-	if !filepath.IsAbs(agentsDir) {
-		agentsDir = filepath.Join(filepath.Dir(h.configPath), agentsDir)
+	return zap.NewNop()
+}
+
+type frontendOpenAIConfigPayload struct {
+	OpenAI *frontendOpenAIConfig `json:"openai"`
+}
+
+type frontendOpenAIConfig struct {
+	Provider  *string                        `json:"provider"`
+	APIKey    *string                        `json:"api_key"`
+	BaseURL   *string                        `json:"base_url"`
+	Model     *string                        `json:"model"`
+	Reasoning *frontendOpenAIReasoningConfig `json:"reasoning"`
+}
+
+type frontendOpenAIReasoningConfig struct {
+	Effort *string `json:"effort"`
+}
+
+func (h *ConfigHandler) syncFrontendOpenAIConfigFromRust(body []byte) error {
+	if len(bytes.TrimSpace(body)) == 0 {
+		return nil
 	}
-	if load, err := agents.LoadMarkdownAgentsDir(agentsDir); err == nil {
-		subAgentCount = len(agents.MergeYAMLAndMarkdown(h.config.MultiAgent.SubAgents, load.SubAgents))
+	var payload frontendOpenAIConfigPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return err
 	}
-	multiPub := config.MultiAgentPublic{
-		Enabled:                      h.config.MultiAgent.Enabled,
-		RobotDefaultAgentMode:        config.NormalizeRobotAgentMode(h.config.MultiAgent),
-		BatchUseMultiAgent:           h.config.MultiAgent.BatchUseMultiAgent,
-		SubAgentCount:                subAgentCount,
-		Orchestration:                config.NormalizeMultiAgentOrchestration(h.config.MultiAgent.Orchestration),
-		PlanExecuteLoopMaxIterations: h.config.MultiAgent.PlanExecuteLoopMaxIterations,
-		ToolSearchAlwaysVisibleTools: append([]string(nil), h.config.MultiAgent.EinoMiddleware.ToolSearchAlwaysVisibleTools...),
-		ToolSearchAlwaysVisibleEffectiveTools: mergeToolNameLists(
-			h.config.MultiAgent.EinoMiddleware.ToolSearchAlwaysVisibleTools,
-			builtin.GetAllBuiltinTools(),
-		),
+	if payload.OpenAI == nil || h == nil {
+		return nil
 	}
 
-	c.JSON(http.StatusOK, GetConfigResponse{
-		OpenAI:       h.config.OpenAI,
-		Vision:       h.config.Vision,
-		FOFA:         h.config.FOFA,
-		MCP:          h.config.MCP,
-		Tools:        tools,
-		Agent:        h.config.Agent,
-		Hitl:         h.config.Hitl,
-		Knowledge:    h.config.Knowledge,
-		AgentRuntime: h.config.AgentRuntimeEffective(),
-		CodexRuntime: h.config.AgentRuntimeEffective(),
-		C2:           h.config.C2.Public(),
-		Robots:       h.config.Robots,
-		MultiAgent:   multiPub,
-	})
+	h.mu.Lock()
+	if h.config == nil {
+		h.mu.Unlock()
+		return nil
+	}
+	applyFrontendOpenAIConfig(&h.config.OpenAI, payload.OpenAI)
+	next := h.config.OpenAI
+	h.mu.Unlock()
+
+	if h.agent != nil {
+		h.agent.UpdateConfig(&next)
+	}
+	if h.attackChainHandler != nil {
+		h.attackChainHandler.UpdateConfig(&next)
+	}
+	h.log().Info("已从 PostgreSQL 同步前端 OpenAI 配置到运行时",
+		zap.String("provider", next.Provider),
+		zap.String("base_url", next.BaseURL),
+		zap.String("model", next.Model),
+		zap.String("reasoning_effort", next.Reasoning.Effort),
+	)
+	return nil
+}
+
+func applyFrontendOpenAIConfig(dst *config.OpenAIConfig, src *frontendOpenAIConfig) {
+	if dst == nil || src == nil {
+		return
+	}
+	if src.Provider != nil {
+		dst.Provider = *src.Provider
+	}
+	if src.APIKey != nil {
+		dst.APIKey = *src.APIKey
+	}
+	if src.BaseURL != nil {
+		dst.BaseURL = *src.BaseURL
+	}
+	if src.Model != nil {
+		dst.Model = *src.Model
+	}
+	if src.Reasoning != nil && src.Reasoning.Effort != nil {
+		dst.Reasoning.Effort = *src.Reasoning.Effort
+	}
 }
 
 // GetToolsResponse 获取工具列表响应（分页）
@@ -677,294 +755,6 @@ func (h *ConfigHandler) GetTools(c *gin.Context) {
 	})
 }
 
-// UpdateConfigRequest 更新配置请求
-type UpdateConfigRequest struct {
-	OpenAI     *config.OpenAIConfig        `json:"openai,omitempty"`
-	Vision     *config.VisionConfig        `json:"vision,omitempty"`
-	FOFA       *config.FofaConfig          `json:"fofa,omitempty"`
-	MCP        *config.MCPConfig           `json:"mcp,omitempty"`
-	Tools      []ToolEnableStatus          `json:"tools,omitempty"`
-	Agent      *AgentConfigUpdate          `json:"agent,omitempty"`
-	Knowledge  *config.KnowledgeConfig     `json:"knowledge,omitempty"`
-	Robots     *config.RobotsConfig        `json:"robots,omitempty"`
-	MultiAgent *config.MultiAgentAPIUpdate `json:"multi_agent,omitempty"`
-	C2         *config.C2APIUpdate         `json:"c2,omitempty"`
-}
-
-// AgentConfigUpdate 用于 PATCH /api/config 的 agent 段：仅 JSON 中出现的字段（指针非 nil）覆盖内存配置。
-// 避免旧版「整包替换 *AgentConfig」时，未传的整型字段被反序列化为 0 误覆盖（例如 tool_timeout_minutes 变成 0）。
-type AgentConfigUpdate struct {
-	MaxIterations      *int    `json:"max_iterations,omitempty"`
-	ToolTimeoutMinutes *int    `json:"tool_timeout_minutes,omitempty"`
-	SystemPromptPath   *string `json:"system_prompt_path,omitempty"`
-}
-
-func applyAgentConfigUpdate(dst *config.AgentConfig, src *AgentConfigUpdate) {
-	if dst == nil || src == nil {
-		return
-	}
-	if src.MaxIterations != nil {
-		dst.MaxIterations = *src.MaxIterations
-	}
-	if src.ToolTimeoutMinutes != nil {
-		dst.ToolTimeoutMinutes = *src.ToolTimeoutMinutes
-	}
-	if src.SystemPromptPath != nil {
-		dst.SystemPromptPath = *src.SystemPromptPath
-	}
-}
-
-// ToolEnableStatus 工具启用状态
-type ToolEnableStatus struct {
-	Name        string `json:"name"`
-	Enabled     bool   `json:"enabled"`
-	IsExternal  bool   `json:"is_external,omitempty"`  // 是否为外部MCP工具
-	ExternalMCP string `json:"external_mcp,omitempty"` // 外部MCP名称（如果是外部工具）
-}
-
-// UpdateConfig 更新配置
-func (h *ConfigHandler) UpdateConfig(c *gin.Context) {
-	var req UpdateConfigRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求参数: " + err.Error()})
-		return
-	}
-
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	// 更新OpenAI配置
-	if req.OpenAI != nil {
-		h.config.OpenAI = *req.OpenAI
-		h.logger.Info("更新OpenAI配置",
-			zap.String("base_url", h.config.OpenAI.BaseURL),
-			zap.String("model", h.config.OpenAI.Model),
-		)
-	}
-
-	if req.Vision != nil {
-		h.config.Vision = *req.Vision
-		h.logger.Info("更新 Vision 配置",
-			zap.Bool("enabled", h.config.Vision.Enabled),
-			zap.String("model", h.config.Vision.Model),
-		)
-	}
-
-	// 更新FOFA配置
-	if req.FOFA != nil {
-		h.config.FOFA = *req.FOFA
-		h.logger.Info("更新FOFA配置", zap.String("email", h.config.FOFA.Email))
-	}
-
-	// 更新MCP配置
-	if req.MCP != nil {
-		h.config.MCP = *req.MCP
-		h.logger.Info("更新MCP配置",
-			zap.Bool("enabled", h.config.MCP.Enabled),
-			zap.String("host", h.config.MCP.Host),
-			zap.Int("port", h.config.MCP.Port),
-		)
-	}
-
-	// 更新Agent配置（按字段合并，避免部分 JSON 把未出现的字段写成 0）
-	if req.Agent != nil {
-		applyAgentConfigUpdate(&h.config.Agent, req.Agent)
-		h.logger.Info("更新Agent配置",
-			zap.Int("max_iterations", h.config.Agent.MaxIterations),
-			zap.Int("tool_timeout_minutes", h.config.Agent.ToolTimeoutMinutes),
-		)
-		if h.agent != nil && req.Agent.MaxIterations != nil {
-			h.agent.UpdateMaxIterations(h.config.Agent.MaxIterations)
-		}
-		if h.mcpServer != nil {
-			h.mcpServer.ConfigureHTTPToolCallTimeoutFromAgentMinutes(h.config.Agent.ToolTimeoutMinutes)
-		}
-	}
-
-	// 更新Knowledge配置
-	if req.Knowledge != nil {
-		// 保存旧的嵌入模型配置（用于检测变更）
-		if h.config.Knowledge.Enabled {
-			h.lastEmbeddingConfig = &config.EmbeddingConfig{
-				Provider: h.config.Knowledge.Embedding.Provider,
-				Model:    h.config.Knowledge.Embedding.Model,
-				BaseURL:  h.config.Knowledge.Embedding.BaseURL,
-				APIKey:   h.config.Knowledge.Embedding.APIKey,
-			}
-		}
-		h.config.Knowledge = *req.Knowledge
-		h.logger.Info("更新Knowledge配置",
-			zap.Bool("enabled", h.config.Knowledge.Enabled),
-			zap.String("base_path", h.config.Knowledge.BasePath),
-			zap.String("embedding_model", h.config.Knowledge.Embedding.Model),
-			zap.Int("retrieval_top_k", h.config.Knowledge.Retrieval.TopK),
-			zap.Float64("similarity_threshold", h.config.Knowledge.Retrieval.SimilarityThreshold),
-		)
-	}
-
-	// 更新机器人配置
-	if req.Robots != nil {
-		h.config.Robots = *req.Robots
-		h.logger.Info("更新机器人配置",
-			zap.Bool("wechat_enabled", h.config.Robots.Wechat.Enabled),
-			zap.Bool("wecom_enabled", h.config.Robots.Wecom.Enabled),
-			zap.Bool("dingtalk_enabled", h.config.Robots.Dingtalk.Enabled),
-			zap.Bool("lark_enabled", h.config.Robots.Lark.Enabled),
-		)
-	}
-
-	if req.C2 != nil {
-		v := req.C2.Enabled
-		h.config.C2.Enabled = &v
-		h.logger.Info("更新C2配置", zap.Bool("enabled", v))
-	}
-
-	// 多代理标量（sub_agents 等仍由 config.yaml 维护）
-	if req.MultiAgent != nil {
-		h.config.MultiAgent.Enabled = req.MultiAgent.Enabled
-		h.config.MultiAgent.BatchUseMultiAgent = req.MultiAgent.BatchUseMultiAgent
-		if mode := strings.TrimSpace(req.MultiAgent.RobotDefaultAgentMode); mode != "" {
-			h.config.MultiAgent.RobotDefaultAgentMode = mode
-		} else {
-			h.config.MultiAgent.RobotDefaultAgentMode = "eino_single"
-		}
-		if req.MultiAgent.PlanExecuteLoopMaxIterations != nil {
-			h.config.MultiAgent.PlanExecuteLoopMaxIterations = *req.MultiAgent.PlanExecuteLoopMaxIterations
-		}
-		if req.MultiAgent.ToolSearchAlwaysVisibleTools != nil {
-			h.config.MultiAgent.EinoMiddleware.ToolSearchAlwaysVisibleTools = dedupeToolNameList(*req.MultiAgent.ToolSearchAlwaysVisibleTools)
-		}
-		h.logger.Info("更新多代理配置",
-			zap.Bool("enabled", h.config.MultiAgent.Enabled),
-			zap.String("robot_default_agent_mode", config.NormalizeRobotAgentMode(h.config.MultiAgent)),
-			zap.Bool("batch_use_multi_agent", h.config.MultiAgent.BatchUseMultiAgent),
-			zap.Int("plan_execute_loop_max_iterations", h.config.MultiAgent.PlanExecuteLoopMaxIterations),
-			zap.Int("tool_search_always_visible_tools", len(h.config.MultiAgent.EinoMiddleware.ToolSearchAlwaysVisibleTools)),
-		)
-	}
-
-	// 更新工具启用状态
-	if req.Tools != nil {
-		// 分离内部工具和外部工具
-		internalToolMap := make(map[string]bool)
-		// 外部工具状态：MCP名称 -> 工具名称 -> 启用状态
-		externalMCPToolMap := make(map[string]map[string]bool)
-
-		for _, toolStatus := range req.Tools {
-			if toolStatus.IsExternal && toolStatus.ExternalMCP != "" {
-				// 外部工具：保存每个工具的独立状态
-				mcpName := toolStatus.ExternalMCP
-				if externalMCPToolMap[mcpName] == nil {
-					externalMCPToolMap[mcpName] = make(map[string]bool)
-				}
-				externalMCPToolMap[mcpName][toolStatus.Name] = toolStatus.Enabled
-			} else {
-				// 内部工具
-				internalToolMap[toolStatus.Name] = toolStatus.Enabled
-			}
-		}
-
-		// 更新内部工具状态
-		for i := range h.config.Security.Tools {
-			if enabled, ok := internalToolMap[h.config.Security.Tools[i].Name]; ok {
-				h.config.Security.Tools[i].Enabled = enabled
-				h.logger.Info("更新工具启用状态",
-					zap.String("tool", h.config.Security.Tools[i].Name),
-					zap.Bool("enabled", enabled),
-				)
-			}
-		}
-
-		// 更新外部MCP工具状态
-		if h.externalMCPMgr != nil {
-			for mcpName, toolStates := range externalMCPToolMap {
-				// 更新配置中的工具启用状态
-				if h.config.ExternalMCP.Servers == nil {
-					h.config.ExternalMCP.Servers = make(map[string]config.ExternalMCPServerConfig)
-				}
-				cfg, exists := h.config.ExternalMCP.Servers[mcpName]
-				if !exists {
-					h.logger.Warn("外部MCP配置不存在", zap.String("mcp", mcpName))
-					continue
-				}
-
-				// 初始化ToolEnabled map
-				if cfg.ToolEnabled == nil {
-					cfg.ToolEnabled = make(map[string]bool)
-				}
-
-				// 更新每个工具的启用状态
-				for toolName, enabled := range toolStates {
-					cfg.ToolEnabled[toolName] = enabled
-					h.logger.Info("更新外部工具启用状态",
-						zap.String("mcp", mcpName),
-						zap.String("tool", toolName),
-						zap.Bool("enabled", enabled),
-					)
-				}
-
-				// 检查是否有任何工具启用，如果有则启用MCP
-				hasEnabledTool := false
-				for _, enabled := range cfg.ToolEnabled {
-					if enabled {
-						hasEnabledTool = true
-						break
-					}
-				}
-
-				// 如果MCP之前未启用，但现在有工具启用，则启用MCP
-				// 如果MCP之前已启用，保持启用状态（允许部分工具禁用）
-				if !cfg.ExternalMCPEnable && hasEnabledTool {
-					cfg.ExternalMCPEnable = true
-					h.logger.Info("自动启用外部MCP（因为有工具启用）", zap.String("mcp", mcpName))
-				}
-
-				h.config.ExternalMCP.Servers[mcpName] = cfg
-			}
-
-			// 同步更新 externalMCPMgr 中的配置，确保 GetConfigs() 返回最新配置
-			// 在循环外部统一更新，避免重复调用
-			h.externalMCPMgr.LoadConfigs(&h.config.ExternalMCP)
-
-			// 处理MCP连接状态（异步启动，避免阻塞）
-			for mcpName := range externalMCPToolMap {
-				cfg := h.config.ExternalMCP.Servers[mcpName]
-				// 如果MCP需要启用，确保客户端已启动
-				if cfg.ExternalMCPEnable {
-					// 启动外部MCP（如果未启动）- 异步执行，避免阻塞
-					client, exists := h.externalMCPMgr.GetClient(mcpName)
-					if !exists || !client.IsConnected() {
-						go func(name string) {
-							if err := h.externalMCPMgr.StartClient(name); err != nil {
-								h.logger.Warn("启动外部MCP失败",
-									zap.String("mcp", name),
-									zap.Error(err),
-								)
-							} else {
-								h.logger.Info("启动外部MCP",
-									zap.String("mcp", name),
-								)
-							}
-						}(mcpName)
-					}
-				}
-			}
-		}
-	}
-
-	// 保存配置到文件
-	if err := h.saveConfig(); err != nil {
-		h.logger.Error("保存配置失败", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存配置失败: " + err.Error()})
-		return
-	}
-
-	if h.audit != nil {
-		h.audit.RecordOK(c, "config", "update", "更新内存配置", "config", "", nil)
-	}
-	c.JSON(http.StatusOK, gin.H{"message": "配置已更新"})
-}
-
 // TestOpenAIRequest 测试OpenAI连接请求
 type TestOpenAIRequest struct {
 	Provider string `json:"provider"`
@@ -1072,106 +862,6 @@ func (h *ConfigHandler) TestOpenAI(c *gin.Context) {
 		"model":      chatResp.Model,
 		"latency_ms": latency.Milliseconds(),
 	})
-}
-
-// ListModelsRequest 获取模型列表请求（OpenAI 兼容 GET /models）。
-type ListModelsRequest struct {
-	Provider     string `json:"provider"`
-	BaseURL      string `json:"base_url"`
-	BaseURLCamel string `json:"baseURL"`
-	BaseURLLower string `json:"baseUrl"`
-	APIKey       string `json:"api_key"`
-	APIKeyCamel  string `json:"apiKey"`
-}
-
-// ListModels 代理调用上游 GET /models，返回可用模型 id 列表。
-func (h *ConfigHandler) ListModels(c *gin.Context) {
-	var req ListModelsRequest
-	if c.Request.Body != nil {
-		body, err := io.ReadAll(c.Request.Body)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "读取请求参数失败: " + err.Error()})
-			return
-		}
-		if len(bytes.TrimSpace(body)) > 0 {
-			if err := json.Unmarshal(body, &req); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求参数: " + err.Error()})
-				return
-			}
-		}
-	}
-
-	h.mu.RLock()
-	current := h.config.OpenAI
-	h.mu.RUnlock()
-
-	provider := firstNonEmptyString(req.Provider, current.Provider, "openai")
-	apiKey := firstNonEmptyString(req.APIKey, req.APIKeyCamel, current.APIKey)
-	baseURL := firstNonEmptyString(req.BaseURL, req.BaseURLCamel, req.BaseURLLower, current.BaseURL)
-
-	if strings.EqualFold(provider, "claude") || strings.EqualFold(provider, "anthropic") {
-		c.JSON(http.StatusOK, gin.H{
-			"success":   false,
-			"supported": false,
-			"error":     "Claude (Anthropic Messages API) 不支持自动获取模型列表，请手动填写",
-		})
-		return
-	}
-
-	if strings.TrimSpace(apiKey) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "API Key 不能为空"})
-		return
-	}
-
-	baseURL = strings.TrimSuffix(strings.TrimSpace(baseURL), "/")
-	if baseURL == "" {
-		baseURL = "https://api.openai.com/v1"
-	}
-
-	tmpCfg := &config.OpenAIConfig{
-		Provider: provider,
-		BaseURL:  baseURL,
-		APIKey:   strings.TrimSpace(apiKey),
-	}
-	client := openai.NewClient(tmpCfg, nil, h.logger)
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
-	defer cancel()
-
-	models, err := client.ListModels(ctx)
-	if err != nil {
-		if apiErr, ok := err.(*openai.APIError); ok {
-			c.JSON(http.StatusOK, gin.H{
-				"success":   false,
-				"supported": true,
-				"error":     fmt.Sprintf("API 返回错误 (HTTP %d): %s", apiErr.StatusCode, apiErr.Body),
-			})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{
-			"success":   false,
-			"supported": true,
-			"error":     err.Error(),
-		})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{
-		"success":   true,
-		"supported": true,
-		"models":    models,
-		"count":     len(models),
-	})
-}
-
-func firstNonEmptyString(values ...string) string {
-	for _, value := range values {
-		trimmed := strings.TrimSpace(value)
-		if trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
 }
 
 // TestVisionRequest 测试 Vision 模型连接；vision.api_key/base_url 留空时可传 openai 段作回退。

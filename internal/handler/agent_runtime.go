@@ -1,16 +1,18 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"cyberstrike-ai/internal/agent"
@@ -26,191 +28,12 @@ import (
 	"go.uber.org/zap"
 )
 
-// AgentRuntimeLoopStream streams a turn through the independent Rust Agent Runtime.
+// AgentRuntimeLoopStream is the transitional Go auth boundary for the Rust-owned
+// Agent Runtime chat endpoint. It must not prepare conversations, messages, HITL,
+// runtime commands, or final assistant messages; Rust owns that lifecycle.
 func (h *AgentHandler) AgentRuntimeLoopStream(c *gin.Context) {
-	c.Header("Content-Type", "text/event-stream; charset=utf-8")
-	c.Header("Cache-Control", "no-cache")
-	c.Header("Connection", "keep-alive")
-	c.Header("X-Accel-Buffering", "no")
-
-	var req ChatRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		writeStreamEvent(c, StreamEvent{Type: "error", Message: "请求参数错误: " + err.Error()})
-		writeStreamEvent(c, StreamEvent{Type: "done", Message: ""})
-		return
-	}
-
-	var writeMu sync.Mutex
-	var clientDisconnected bool
-	var publishConversationID string
-	writeClientLine := func(line []byte) {
-		if clientDisconnected {
-			return
-		}
-		select {
-		case <-c.Request.Context().Done():
-			clientDisconnected = true
-			return
-		default:
-		}
-		writeMu.Lock()
-		defer writeMu.Unlock()
-		if _, err := c.Writer.Write(line); err != nil {
-			clientDisconnected = true
-			return
-		}
-		if flusher, ok := c.Writer.(http.Flusher); ok {
-			flusher.Flush()
-		} else {
-			c.Writer.Flush()
-		}
-	}
-	encodeEventLine := func(eventType, message string, data interface{}) []byte {
-		ev := StreamEvent{Type: eventType, Message: message, Data: data}
-		b, err := json.Marshal(ev)
-		if err != nil {
-			b = []byte(`{"type":"error","message":"marshal failed"}`)
-		}
-		line := append([]byte("data: "), b...)
-		line = append(line, '\n', '\n')
-		return line
-	}
-	sendClientEvent := func(eventType, message string, data interface{}) {
-		writeClientLine(encodeEventLine(eventType, message, data))
-	}
-	sendEvent := func(eventType, message string, data interface{}) {
-		line := encodeEventLine(eventType, message, data)
-		if publishConversationID != "" && h.taskEventBus != nil {
-			h.taskEventBus.Publish(publishConversationID, line)
-		}
-		writeClientLine(line)
-	}
-	publishTaskEvent := func(eventType, message string, data interface{}) {
-		if h.taskEventBus == nil {
-			return
-		}
-		cid := publishConversationID
-		if m, ok := data.(map[string]interface{}); ok {
-			if v, ok := m["conversationId"].(string); ok && strings.TrimSpace(v) != "" {
-				cid = strings.TrimSpace(v)
-			}
-		}
-		if cid == "" {
-			return
-		}
-		h.taskEventBus.Publish(cid, encodeEventLine(eventType, message, data))
-	}
-
-	if h.config == nil {
-		sendEvent("error", "服务器配置未加载", nil)
-		sendEvent("done", "", nil)
-		return
-	}
-	runtimeCfg := h.agentRuntimeConfig()
-	if !runtimeCfg.Enabled {
-		sendEvent("error", "Agent runtime 未启用，请在 agent_runtime.enabled 中开启", nil)
-		sendEvent("done", "", nil)
-		return
-	}
-
-	titlePublisher := sendEvent
-	if req.Background {
-		titlePublisher = publishTaskEvent
-	}
-	prep, err := h.prepareMultiAgentSessionWithTitlePublisher(&req, c, "agent_runtime_stream", titlePublisher)
-	if err != nil {
-		sendEvent("error", err.Error(), nil)
-		sendEvent("done", "", nil)
-		return
-	}
-	publishConversationID = prep.ConversationID
-	emitStartupEvent := sendEvent
-	if req.Background {
-		emitStartupEvent = sendClientEvent
-	}
-	if prep.CreatedNew {
-		emitStartupEvent("conversation", "会话已创建", map[string]interface{}{"conversationId": prep.ConversationID})
-	}
-	if prep.UserMessageID != "" {
-		emitStartupEvent("message_saved", "", map[string]interface{}{
-			"conversationId": prep.ConversationID,
-			"userMessageId":  prep.UserMessageID,
-		})
-	}
-
-	conversationID := prep.ConversationID
-	assistantMessageID := prep.AssistantMessageID
-	emitStartupEvent("progress", "正在启动独立 Agent Runtime...", map[string]interface{}{"conversationId": conversationID})
-
-	taskStatus := "completed"
-	baseCtx, cancelWithCause := context.WithCancelCause(context.Background())
-	if _, err := h.tasks.StartTask(conversationID, req.Message, cancelWithCause); err != nil {
-		taskStatus = "failed"
-		msg := "❌ 无法启动任务: " + err.Error()
-		if errors.Is(err, ErrTaskAlreadyRunning) {
-			msg = "⚠️ 当前会话已有任务正在执行中，请等待当前任务完成或点击「停止任务」后再尝试。"
-			emitStartupEvent("error", msg, map[string]interface{}{
-				"conversationId": conversationID,
-				"errorType":      "task_already_running",
-			})
-		} else {
-			emitStartupEvent("error", msg, nil)
-		}
-		if assistantMessageID != "" {
-			_ = h.db.UpdateAssistantMessageFinalize(assistantMessageID, msg, nil, "")
-		}
-		emitStartupEvent("done", "", map[string]interface{}{"conversationId": conversationID})
-		return
-	}
-	h.tasks.SetTaskAgentMode(conversationID, "agent_runtime")
-	h.tasks.SetTaskAssistantMessageID(conversationID, assistantMessageID)
-
-	run := func(ctx context.Context, cancel context.CancelCauseFunc, emit func(eventType, message string, data interface{})) string {
-		return h.executeAgentRuntimeStreamTurn(ctx, cancel, conversationID, assistantMessageID, req, prep.FinalMessage, prep.RoleTools, prep.History, emit)
-	}
-	if req.Background {
-		taskCtx, timeoutCancel := context.WithTimeout(baseCtx, 600*time.Minute)
-		go func() {
-			defer timeoutCancel()
-			emitRuntimeTaskEvent := func(eventType, message string, data interface{}) {
-				if publishConversationID != "" && h.taskEventBus != nil {
-					ev := StreamEvent{Type: eventType, Message: message, Data: data}
-					b, err := json.Marshal(ev)
-					if err != nil {
-						b = []byte(`{"type":"error","message":"marshal failed"}`)
-					}
-					line := append([]byte("data: "), b...)
-					line = append(line, '\n', '\n')
-					h.taskEventBus.Publish(publishConversationID, line)
-				}
-			}
-			if runtimeCfg.TransportEffective() == "grpc" {
-				emitRuntimeTaskEvent = func(string, string, interface{}) {}
-			}
-			status := run(taskCtx, cancelWithCause, emitRuntimeTaskEvent)
-			h.tasks.FinishTask(conversationID, status)
-			cancelWithCause(nil)
-		}()
-		// Background mode returns only a startup acknowledgement on the POST response.
-		// Real runtime events are published by the goroutine to TaskEventBus, where the
-		// frontend's single global EventSource routes them by conversationId.
-		sendClientEvent("runtime_status_update", "Agent Runtime 已在后台启动", map[string]interface{}{
-			"conversationId":     conversationID,
-			"runtimeEventType":   "runtime_status_update",
-			"background":         true,
-			"agentMode":          "agent_runtime",
-			"assistantMessageId": assistantMessageID,
-		})
-		sendClientEvent("done", "", map[string]interface{}{"conversationId": conversationID, "background": true})
-		return
-	}
-	taskCtx, timeoutCancel := context.WithTimeout(baseCtx, 600*time.Minute)
-	defer timeoutCancel()
-	defer func() {
-		h.tasks.FinishTask(conversationID, taskStatus)
-		cancelWithCause(nil)
-	}()
-	taskStatus = run(taskCtx, cancelWithCause, sendEvent)
+	h.log().Info("Agent Runtime stream proxied to Rust API")
+	proxyStreamingRequestToRust(c, h.httpClient, "/api/agent-runtime/stream", c.Request.URL.RawQuery, h.log(), "Rust API Agent Runtime stream")
 }
 
 func (h *AgentHandler) executeAgentRuntimeStreamTurn(
@@ -278,6 +101,7 @@ func (h *AgentHandler) executeAgentRuntimeStreamTurn(
 		progress("error", "Agent Runtime 执行失败: "+err.Error(), map[string]interface{}{"conversationId": conversationID})
 		if assistantMessageID != "" {
 			_ = h.db.UpdateAssistantMessageFinalize(assistantMessageID, "Agent Runtime 执行失败: "+err.Error(), nil, strings.TrimSpace(reasoning.String()))
+			h.syncMessageByIDToRust(context.Background(), conversationID, assistantMessageID)
 		}
 		sendEvent("done", "", map[string]interface{}{"conversationId": conversationID})
 		return taskStatus
@@ -303,6 +127,7 @@ func (h *AgentHandler) executeAgentRuntimeStreamTurn(
 		progress("error", msg, map[string]interface{}{"conversationId": conversationID})
 		if assistantMessageID != "" {
 			_ = h.db.UpdateAssistantMessageFinalize(assistantMessageID, msg, nil, strings.TrimSpace(reasoning.String()))
+			h.syncMessageByIDToRust(context.Background(), conversationID, assistantMessageID)
 		}
 		sendEvent("done", "", map[string]interface{}{"conversationId": conversationID})
 		return taskStatus
@@ -316,6 +141,7 @@ func (h *AgentHandler) executeAgentRuntimeStreamTurn(
 		if err := h.db.UpdateAssistantMessageFinalize(assistantMessageID, response, nil, strings.TrimSpace(reasoning.String())); err != nil {
 			h.logger.Warn("更新 Agent Runtime 助手消息失败", zap.Error(err))
 		}
+		h.syncMessageByIDToRust(context.Background(), conversationID, assistantMessageID)
 	}
 	if lastRuntimeSessionID != "" {
 		_ = h.db.MarkAgentRuntimeTurnFinished(conversationID, lastRuntimeSessionID, lastTurnID, "completed")
@@ -332,6 +158,354 @@ func (h *AgentHandler) executeAgentRuntimeStreamTurn(
 type agentRuntimeRunResult struct {
 	Response  string
 	Reasoning string
+}
+
+type acceptAgentRuntimeStreamRequest struct {
+	ConversationID     string `json:"conversationId"`
+	Message            string `json:"message,omitempty"`
+	AgentMode          string `json:"agentMode,omitempty"`
+	AssistantMessageID string `json:"assistantMessageId,omitempty"`
+	UserMessageID      string `json:"userMessageId,omitempty"`
+	StartedAt          string `json:"startedAt,omitempty"`
+	CreatedNew         bool   `json:"createdNew,omitempty"`
+	Background         bool   `json:"background"`
+	RuntimeBinaryPath  string `json:"runtimeBinaryPath,omitempty"`
+	RuntimeWorkDir     string `json:"runtimeWorkDir,omitempty"`
+	RuntimeCommand     any    `json:"runtimeCommand,omitempty"`
+}
+
+func (h *AgentHandler) agentRuntimeStartTurnCommand(
+	conversationID string,
+	assistantMessageID string,
+	req ChatRequest,
+	finalMessage string,
+	roleTools []string,
+	history []agent.ChatMessage,
+) (agentruntime.Command, error) {
+	if h == nil || h.db == nil {
+		return agentruntime.Command{}, errors.New("database is not initialized")
+	}
+	runtimeSession, err := h.db.GetAgentRuntimeSession(conversationID)
+	if err != nil {
+		return agentruntime.Command{}, err
+	}
+	runtimeSessionID := ""
+	if runtimeSession != nil {
+		runtimeSessionID = runtimeSession.RuntimeSessionID
+	}
+	return agentruntime.Command{
+		Type:             "start_turn",
+		ConversationID:   conversationID,
+		RuntimeSessionID: runtimeSessionID,
+		Message:          finalMessage,
+		Context:          agentRuntimeContextWithAssistantMessageID(h.agentRuntimeContext(conversationID, req, roleTools, history), assistantMessageID),
+	}, nil
+}
+
+func (h *AgentHandler) refreshFrontendOpenAIConfigFromRust(ctx context.Context) error {
+	if h == nil {
+		return nil
+	}
+	cfg := rustAPIProxyConfigFromEnv()
+	target, err := rustAPITarget(cfg, "/api/config", "")
+	if err != nil {
+		return err
+	}
+	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return err
+	}
+	httpReq.Header.Set("Accept", "application/json")
+	client := http.DefaultClient
+	if h.httpClient != nil {
+		client = h.httpClient
+	}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("Rust API config status %d: %s", resp.StatusCode, string(body))
+	}
+	var payload frontendOpenAIConfigPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return err
+	}
+	if payload.OpenAI == nil || h.config == nil {
+		return nil
+	}
+	applyFrontendOpenAIConfig(&h.config.OpenAI, payload.OpenAI)
+	return nil
+}
+
+func (h *AgentHandler) waitForRustAgentRuntimeTaskFinish(ctx context.Context, conversationID string, timeout time.Duration) string {
+	if strings.TrimSpace(conversationID) == "" {
+		return "failed"
+	}
+	if timeout <= 0 {
+		timeout = 600 * time.Minute
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(750 * time.Millisecond)
+	defer ticker.Stop()
+
+	lastStatus := "completed"
+	for {
+		select {
+		case <-ctx.Done():
+			return "cancelled"
+		case <-deadline.C:
+			return "failed"
+		case <-ticker.C:
+			task, found, err := h.getRustAgentRuntimeTask(ctx, conversationID)
+			if err != nil {
+				if h != nil && h.logger != nil {
+					h.logger.Debug("轮询 Rust Agent Runtime 任务状态失败", zap.Error(err), zap.String("conversationId", conversationID))
+				}
+				continue
+			}
+			if !found {
+				continue
+			}
+			if status := strings.TrimSpace(task.Status); status != "" {
+				lastStatus = status
+			}
+			if !task.Active {
+				switch strings.ToLower(lastStatus) {
+				case "cancelled", "failed", "completed":
+					return strings.ToLower(lastStatus)
+				default:
+					return "completed"
+				}
+			}
+		}
+	}
+}
+
+type rustAgentRuntimeTaskStatus struct {
+	ConversationID string
+	Status         string
+	Active         bool
+}
+
+func (h *AgentHandler) getRustAgentRuntimeTask(ctx context.Context, conversationID string) (rustAgentRuntimeTaskStatus, bool, error) {
+	cfg := rustAPIProxyConfigFromEnv()
+	target, err := rustAPITarget(cfg, "/api/internal/agent-runtime/tasks/"+conversationID, "")
+	if err != nil {
+		return rustAgentRuntimeTaskStatus{}, false, err
+	}
+	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return rustAgentRuntimeTaskStatus{}, false, err
+	}
+	client := http.DefaultClient
+	if h != nil && h.httpClient != nil {
+		client = h.httpClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return rustAgentRuntimeTaskStatus{}, false, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return rustAgentRuntimeTaskStatus{}, false, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return rustAgentRuntimeTaskStatus{}, false, fmt.Errorf("Rust API tasks status %d: %s", resp.StatusCode, string(body))
+	}
+	var payload struct {
+		Task *struct {
+			ConversationID string `json:"conversationId"`
+			Status         string `json:"status"`
+			Active         *bool  `json:"active"`
+		} `json:"task"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return rustAgentRuntimeTaskStatus{}, false, err
+	}
+	if payload.Task == nil {
+		return rustAgentRuntimeTaskStatus{}, false, nil
+	}
+	active := true
+	if payload.Task.Active != nil {
+		active = *payload.Task.Active
+	}
+	return rustAgentRuntimeTaskStatus{
+		ConversationID: payload.Task.ConversationID,
+		Status:         payload.Task.Status,
+		Active:         active,
+	}, true, nil
+}
+
+func (h *AgentHandler) finalizeBackgroundAgentRuntimeFromRust(ctx context.Context, conversationID, assistantMessageID string) {
+	conversationID = strings.TrimSpace(conversationID)
+	assistantMessageID = strings.TrimSpace(assistantMessageID)
+	if h == nil || h.db == nil || conversationID == "" || assistantMessageID == "" {
+		return
+	}
+	response, err := h.waitForRustAgentRuntimeFinalResponse(ctx, conversationID)
+	if err != nil {
+		if h.logger != nil {
+			h.logger.Warn("读取 Rust Agent Runtime 最终响应失败", zap.String("conversationId", conversationID), zap.Error(err))
+		}
+		return
+	}
+	response = strings.TrimSpace(response)
+	if response == "" {
+		if h.logger != nil {
+			h.logger.Warn("Rust Agent Runtime 已完成但没有最终助手正文", zap.String("conversationId", conversationID))
+		}
+		return
+	}
+	if err := h.db.UpdateAssistantMessageFinalize(assistantMessageID, response, nil, ""); err != nil {
+		if h.logger != nil {
+			h.logger.Warn("更新后台 Agent Runtime 助手消息失败", zap.String("conversationId", conversationID), zap.String("messageId", assistantMessageID), zap.Error(err))
+		}
+		return
+	}
+	h.syncMessageByIDToRust(context.Background(), conversationID, assistantMessageID)
+}
+
+func (h *AgentHandler) waitForRustAgentRuntimeFinalResponse(ctx context.Context, conversationID string) (string, error) {
+	ticker := time.NewTicker(250 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastErr error
+	for {
+		response, err := h.fetchRustAgentRuntimeFinalResponse(ctx, conversationID)
+		if err != nil {
+			lastErr = err
+		}
+		if strings.TrimSpace(response) != "" {
+			return response, nil
+		}
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return "", lastErr
+			}
+			return "", ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func (h *AgentHandler) fetchRustAgentRuntimeFinalResponse(ctx context.Context, conversationID string) (string, error) {
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" {
+		return "", errors.New("conversationID is required")
+	}
+	cfg := rustAPIProxyConfigFromEnv()
+	target, err := rustAPITarget(cfg, "/api/internal/agent-runtime/final-response/"+url.PathEscape(conversationID), "")
+	if err != nil {
+		return "", err
+	}
+	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "application/json")
+	client := http.DefaultClient
+	if h != nil && h.httpClient != nil {
+		client = h.httpClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return "", fmt.Errorf("Rust API final-response status %d: %s", resp.StatusCode, string(body))
+	}
+	var payload struct {
+		Response string `json:"response"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(payload.Response), nil
+}
+
+func (h *AgentHandler) acceptAgentRuntimeStreamViaRust(ctx context.Context, payload acceptAgentRuntimeStreamRequest) (status int, body []byte, contentType string, ok bool) {
+	reqBody, err := json.Marshal(payload)
+	if err != nil {
+		if h != nil && h.logger != nil {
+			h.logger.Warn("序列化 Agent Runtime stream 启动请求失败", zap.Error(err))
+		}
+		return http.StatusBadRequest, []byte(`{"error":"invalid stream request"}`), "application/json; charset=utf-8", true
+	}
+	cfg := rustAPIProxyConfigFromEnv()
+	target, err := rustAPITarget(cfg, "/api/agent-runtime/stream", "")
+	if err != nil {
+		if h != nil && h.logger != nil {
+			h.logger.Error("Rust API Agent Runtime stream target invalid", zap.Error(err))
+		}
+		return http.StatusBadGateway, []byte(`{"error":"Rust API base URL invalid"}`), "application/json; charset=utf-8", true
+	}
+	timeout := time.Duration(cfg.TimeoutSeconds) * time.Second
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	httpReq, err := http.NewRequestWithContext(callCtx, http.MethodPost, target.String(), bytes.NewReader(reqBody))
+	if err != nil {
+		if h != nil && h.logger != nil {
+			h.logger.Warn("创建 Agent Runtime stream Rust 请求失败", zap.Error(err))
+		}
+		return http.StatusBadGateway, []byte(`{"error":"Rust API request failed"}`), "application/json; charset=utf-8", true
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	client := http.DefaultClient
+	if h != nil && h.httpClient != nil {
+		client = h.httpClient
+	}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		if h != nil && h.logger != nil {
+			h.logger.Error("Rust API Agent Runtime stream 请求失败", zap.String("url", target.String()), zap.Error(err))
+		}
+		return http.StatusBadGateway, []byte(fmt.Sprintf(`{"error":"Rust API unavailable: %s"}`, err.Error())), "application/json; charset=utf-8", true
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		if h != nil && h.logger != nil {
+			h.logger.Warn("读取 Rust API Agent Runtime stream 响应失败", zap.Error(err))
+		}
+		return http.StatusBadGateway, []byte(`{"error":"Rust API response read failed"}`), "application/json; charset=utf-8", true
+	}
+	return resp.StatusCode, respBody, resp.Header.Get("Content-Type"), true
 }
 
 func (h *AgentHandler) runAgentRuntimeTurn(
@@ -682,6 +856,7 @@ func (h *AgentHandler) resumeAgentRuntimeApproval(ctx context.Context, requestID
 		if err := h.db.UpdateAssistantMessageFinalize(interrupt.MessageID, response, nil, strings.TrimSpace(reasoning.String())); err != nil {
 			return err
 		}
+		h.syncMessageByIDToRust(context.Background(), interrupt.ConversationID, interrupt.MessageID)
 	}
 	_ = h.db.MarkAgentRuntimeTurnFinished(interrupt.ConversationID, runtimeSessionID, "", "completed")
 	progress("response", response, map[string]interface{}{
@@ -1086,16 +1261,26 @@ func (h *AgentHandler) agentRuntimeContext(conversationID string, req ChatReques
 			ctx["openai_reasoning_effort"] = effort
 		}
 	}
+	if _, ok := ctx["openai_reasoning_effort"]; !ok {
+		if effort := strings.TrimSpace(h.config.OpenAI.Reasoning.Effort); effort != "" {
+			ctx["openai_reasoning_effort"] = effort
+		}
+	}
 	ctx["max_steps"] = runtimeCfg.MaxStepsEffective()
 	ctx["tool_timeout_seconds"] = runtimeCfg.ToolTimeoutSecondsEffective()
 	ctx["workspace_root"] = h.agentRuntimeWorkDir()
 	ctx["filesystem_enabled"] = !h.config.MultiAgent.EinoSkills.Disable && h.config.MultiAgent.EinoSkills.EinoSkillFilesystemToolsEffective()
 	ctx["session_store_dir"] = filepath.Join(h.agentRuntimeWorkDir(), ".cyberstrike-agent-runtime", "sessions")
-	ctx["mcp_enabled"] = runtimeCfg.MCPEnabled
-	ctx["mcp_endpoint_url"] = h.agentRuntimeMCPEndpointURL()
+	mcpToolsDir := filepath.Join(h.agentRuntimeWorkDir(), "tools")
+	externalMCPEndpointURL := h.agentRuntimeMCPEndpointURL()
+	ctx["mcp_enabled"] = runtimeCfg.MCPEnabled || mcpToolsDir != ""
+	ctx["mcp_endpoint_url"] = externalMCPEndpointURL
+	ctx["external_mcp_endpoint_url"] = externalMCPEndpointURL
 	ctx["mcp_auth_header"] = strings.TrimSpace(h.config.MCP.AuthHeader)
 	ctx["mcp_auth_header_value"] = strings.TrimSpace(h.config.MCP.AuthHeaderValue)
-	ctx["mcp_tools"] = h.agentRuntimeMCPTools(roleTools)
+	ctx["role_tools"] = roleTools
+	ctx["mcp_tools_dir"] = mcpToolsDir
+	ctx["mcp_tools"] = []map[string]interface{}{}
 	ctx["skills_enabled"] = runtimeCfg.SkillsEnabled
 	ctx["skills_dir"] = h.agentRuntimeSkillsDir()
 	ctx["skills_source"] = runtimeCfg.SkillsSourceEffective()
@@ -1107,6 +1292,10 @@ func (h *AgentHandler) agentRuntimeContext(conversationID string, req ChatReques
 	ctx["knowledge_snippets"] = h.agentRuntimeKnowledgeSnippets(conversationID, req.Message)
 	ctx["approval_enabled"] = runtimeCfg.ApprovalEnabled && req.Hitl != nil && req.Hitl.Enabled
 	ctx["approval_allowlist"] = h.agentRuntimeApprovalAllowlist(req)
+	if req.Hitl != nil && req.Hitl.TimeoutSeconds > 0 {
+		ctx["hitl_timeout_seconds"] = int(req.Hitl.TimeoutSeconds)
+		ctx["approval_timeout_seconds"] = int(req.Hitl.TimeoutSeconds)
+	}
 	ctx["compaction_enabled"] = runtimeCfg.CompactionEnabled
 	ctx["compaction_threshold_chars"] = runtimeCfg.CompactionThresholdCharsEffective()
 	ctx["compaction_keep_recent_messages"] = runtimeCfg.CompactionKeepRecentMessagesEffective()

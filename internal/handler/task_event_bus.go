@@ -14,6 +14,7 @@ type TaskEventBus struct {
 	mu         sync.RWMutex
 	subs       map[string]map[*taskEventSub]struct{}
 	globalSubs map[*taskEventSub]struct{}
+	persist    func(conversationID string, line []byte)
 }
 
 type taskEventSub struct {
@@ -57,6 +58,15 @@ func NewTaskEventBus() *TaskEventBus {
 		subs:       make(map[string]map[*taskEventSub]struct{}),
 		globalSubs: make(map[*taskEventSub]struct{}),
 	}
+}
+
+func (b *TaskEventBus) SetPersistHook(persist func(conversationID string, line []byte)) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.persist = persist
+	b.mu.Unlock()
 }
 
 // Subscribe 注册订阅；cancel 时需调用 Unsubscribe。
@@ -128,9 +138,22 @@ func (b *TaskEventBus) Publish(conversationID string, line []byte) {
 	b.mu.RUnlock()
 
 	cp := append([]byte(nil), ensureTaskEventConversationID(conversationID, line)...)
+	if persist := b.persistHook(); persist != nil {
+		persistLine := append([]byte(nil), cp...)
+		go persist(conversationID, persistLine)
+	}
 	for _, s := range subs {
 		s.sendNonBlocking(cp)
 	}
+}
+
+func (b *TaskEventBus) persistHook() func(conversationID string, line []byte) {
+	if b == nil {
+		return nil
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.persist
 }
 
 // CloseConversation 任务结束时关闭该会话所有订阅 channel。

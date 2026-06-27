@@ -53,6 +53,7 @@ func (h *AgentHandler) prepareMultiAgentSessionWithTitlePublisher(req *ChatReque
 		}
 		conversationID = conv.ID
 		createdNew = true
+		h.syncConversationRecordToRust(c.Request.Context(), conv)
 	} else {
 		if _, err := h.db.GetConversation(conversationID); err != nil {
 			return nil, fmt.Errorf("对话不存在")
@@ -129,6 +130,7 @@ func (h *AgentHandler) prepareMultiAgentSessionWithTitlePublisher(req *ChatReque
 	userMessageID := ""
 	if userMsgRow != nil {
 		userMessageID = userMsgRow.ID
+		h.syncMessageRecordToRust(c.Request.Context(), userMsgRow)
 	}
 	h.maybeStartConversationTitleGeneration(conversationID, userContent, publish)
 
@@ -138,6 +140,7 @@ func (h *AgentHandler) prepareMultiAgentSessionWithTitlePublisher(req *ChatReque
 		h.logger.Warn("创建助手消息占位失败", zap.Error(aerr))
 	} else if assistantMsg != nil {
 		assistantMessageID = assistantMsg.ID
+		h.syncMessageRecordToRust(c.Request.Context(), assistantMsg)
 	}
 
 	return &multiAgentPrepared{

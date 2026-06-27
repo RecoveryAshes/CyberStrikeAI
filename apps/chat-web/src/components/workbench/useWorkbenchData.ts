@@ -16,7 +16,8 @@ export function useWorkbenchData(search: string, conversationId?: string) {
   const tasks = useQuery({
     queryKey: ["tasks"],
     queryFn: Api.tasks,
-    refetchInterval: 2500
+    refetchOnWindowFocus: true,
+    refetchInterval: false
   });
   const hitl = useQuery({
     queryKey: ["hitl", conversationId],
@@ -27,7 +28,15 @@ export function useWorkbenchData(search: string, conversationId?: string) {
     queryKey: ["hitl-pending", conversationId],
     queryFn: () => Api.hitlPending(conversationId),
     enabled: Boolean(conversationId),
-    refetchInterval: 4000
+    refetchOnWindowFocus: true,
+    refetchInterval: false
+  });
+  const runtimeTodos = useQuery({
+    queryKey: ["runtime-todos", conversationId],
+    queryFn: () => Api.runtimeTodos(conversationId!),
+    enabled: Boolean(conversationId),
+    refetchOnWindowFocus: true,
+    refetchInterval: false
   });
 
   const createConversation = useMutation({
@@ -73,6 +82,7 @@ export function useWorkbenchData(search: string, conversationId?: string) {
     tasks,
     hitl,
     pending,
+    runtimeTodos,
     createConversation,
     renameConversation,
     deleteConversation,

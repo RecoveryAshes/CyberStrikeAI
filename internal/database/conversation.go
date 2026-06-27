@@ -44,7 +44,15 @@ func (db *DB) CreateConversation(title string, meta ConversationCreateMeta) (*Co
 
 // CreateConversationWithWebshell 创建新对话，可选绑定 WebShell 连接 ID（为空则普通对话）
 func (db *DB) CreateConversationWithWebshell(webshellConnectionID, title string, meta ConversationCreateMeta) (*Conversation, error) {
-	id := uuid.New().String()
+	return db.CreateConversationWithID("", webshellConnectionID, title, meta)
+}
+
+// CreateConversationWithID creates a conversation with a caller-provided ID when id is non-empty.
+func (db *DB) CreateConversationWithID(id, webshellConnectionID, title string, meta ConversationCreateMeta) (*Conversation, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		id = uuid.New().String()
+	}
 	now := time.Now()
 
 	projectID := strings.TrimSpace(meta.ProjectID)

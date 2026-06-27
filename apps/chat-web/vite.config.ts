@@ -2,7 +2,7 @@ import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 import path from "node:path";
 
-const apiProxyTarget = process.env.VITE_API_BASE_URL || "http://192.168.64.2:51282";
+const apiProxyTarget = process.env.RUSTAPI_PROXY_TARGET || process.env.API_PROXY_TARGET || "http://192.168.64.2:51283";
 const apiProxy = {
   "/api": {
     target: apiProxyTarget,

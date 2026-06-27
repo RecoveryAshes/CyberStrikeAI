@@ -774,19 +774,35 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 				},
 				"ConfigResponse": map[string]interface{}{
 					"type":        "object",
-					"description": "配置信息（含 openai、vision、multi_agent 等）",
+					"description": "4177 chat-web 前端配置（PostgreSQL，仅 openai 字段）",
 					"properties": map[string]interface{}{
-						"vision": map[string]interface{}{
-							"$ref": "#/components/schemas/VisionConfig",
+						"openai": map[string]interface{}{
+							"$ref": "#/components/schemas/FrontendOpenAIConfig",
 						},
 					},
 				},
 				"UpdateConfigRequest": map[string]interface{}{
 					"type":        "object",
-					"description": "更新配置请求",
+					"description": "更新 4177 chat-web 前端配置（PostgreSQL，仅 openai 字段）",
 					"properties": map[string]interface{}{
-						"vision": map[string]interface{}{
-							"$ref": "#/components/schemas/VisionConfig",
+						"openai": map[string]interface{}{
+							"$ref": "#/components/schemas/FrontendOpenAIConfig",
+						},
+					},
+				},
+				"FrontendOpenAIConfig": map[string]interface{}{
+					"type":        "object",
+					"description": "4177 chat-web 使用的 OpenAI 配置字段",
+					"properties": map[string]interface{}{
+						"provider": map[string]interface{}{"type": "string"},
+						"api_key":  map[string]interface{}{"type": "string"},
+						"base_url": map[string]interface{}{"type": "string"},
+						"model":    map[string]interface{}{"type": "string"},
+						"reasoning": map[string]interface{}{
+							"type": "object",
+							"properties": map[string]interface{}{
+								"effort": map[string]interface{}{"type": "string"},
+							},
 						},
 					},
 				},
@@ -1410,6 +1426,52 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 						"200": map[string]interface{}{"description": "设置成功"},
 						"400": map[string]interface{}{"description": "项目不存在或参数错误"},
 						"404": map[string]interface{}{"description": "对话不存在"},
+						"401": map[string]interface{}{"description": "未授权"},
+					},
+				},
+			},
+			"/api/conversations/{id}/runtime-todos": map[string]interface{}{
+				"get": map[string]interface{}{
+					"tags":        []string{"对话管理"},
+					"summary":     "获取会话级 Runtime Todo",
+					"description": "获取指定会话持久化的 Agent Runtime Todo 快照，用于刷新后恢复运行状态。",
+					"operationId": "getConversationRuntimeTodos",
+					"parameters": []map[string]interface{}{
+						{
+							"name":        "id",
+							"in":          "path",
+							"required":    true,
+							"description": "对话ID",
+							"schema":      map[string]interface{}{"type": "string"},
+						},
+					},
+					"responses": map[string]interface{}{
+						"200": map[string]interface{}{
+							"description": "获取成功",
+							"content": map[string]interface{}{
+								"application/json": map[string]interface{}{
+									"schema": map[string]interface{}{
+										"type": "object",
+										"properties": map[string]interface{}{
+											"conversationId": map[string]interface{}{"type": "string"},
+											"todos": map[string]interface{}{
+												"type": "array",
+												"items": map[string]interface{}{
+													"type": "object",
+													"properties": map[string]interface{}{
+														"itemId":    map[string]interface{}{"type": "string"},
+														"content":   map[string]interface{}{"type": "string"},
+														"status":    map[string]interface{}{"type": "string", "enum": []string{"pending", "in_progress", "completed", "cancelled"}},
+														"position":  map[string]interface{}{"type": "integer"},
+														"updatedAt": map[string]interface{}{"type": "string", "format": "date-time"},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
 						"401": map[string]interface{}{"description": "未授权"},
 					},
 				},
@@ -3589,8 +3651,8 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 			"/api/config": map[string]interface{}{
 				"get": map[string]interface{}{
 					"tags":        []string{"配置管理"},
-					"summary":     "获取配置",
-					"description": "获取系统配置信息",
+					"summary":     "获取前端配置",
+					"description": "获取 4177 chat-web 前端使用的 OpenAI 配置（PostgreSQL）",
 					"operationId": "getConfig",
 					"responses": map[string]interface{}{
 						"200": map[string]interface{}{
@@ -3610,8 +3672,8 @@ func (h *OpenAPIHandler) GetOpenAPISpec(c *gin.Context) {
 				},
 				"put": map[string]interface{}{
 					"tags":        []string{"配置管理"},
-					"summary":     "更新配置",
-					"description": "更新系统配置",
+					"summary":     "更新前端配置",
+					"description": "只更新 4177 chat-web 前端使用的 OpenAI 配置字段，并保存到 PostgreSQL",
 					"operationId": "updateConfig",
 					"requestBody": map[string]interface{}{
 						"required": true,

@@ -984,6 +984,7 @@ func setupRoutes(
 		protected.POST("/conversations", conversationHandler.CreateConversation)
 		protected.GET("/conversations", conversationHandler.ListConversations)
 		protected.GET("/conversations/:id", conversationHandler.GetConversation)
+		protected.GET("/conversations/:id/runtime-todos", conversationHandler.GetRuntimeTodos)
 		protected.GET("/messages/:id/process-details", conversationHandler.GetMessageProcessDetails)
 		protected.PUT("/conversations/:id", conversationHandler.UpdateConversation)
 		protected.PUT("/conversations/:id/project", conversationHandler.SetConversationProject)

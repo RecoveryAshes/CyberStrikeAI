@@ -4,6 +4,7 @@ use thiserror::Error;
 use crate::filesystem_runtime::FilesystemRuntime;
 use crate::knowledge_runtime::KnowledgeRuntime;
 use crate::mcp_bridge::{wrapped_mcp_result_is_error, McpBridge, MODEL_TOOL_NAME_MAX_LEN};
+use crate::mcp_registry::{McpLoadedTools, McpRegistryTool, McpToolRegistry};
 use crate::model_stream::ModelToolCall;
 use crate::plan_store::PlanStore;
 use crate::skill_runtime::SkillRuntime;
@@ -34,8 +35,11 @@ pub struct ToolExecutionContext<'a> {
     pub plan: &'a mut PlanStore,
     pub skills: &'a SkillRuntime,
     pub mcp: &'a McpBridge,
+    pub mcp_registry: &'a McpToolRegistry,
+    pub mcp_loaded: &'a mut McpLoadedTools,
     pub knowledge: &'a KnowledgeRuntime,
     pub filesystem: &'a FilesystemRuntime,
+    pub tool_timeout_seconds: u64,
 }
 
 #[derive(Debug, Default)]
@@ -56,6 +60,7 @@ enum ToolKind {
     RuntimeEcho,
     Skill,
     McpCall,
+    McpToolSearch,
     KnowledgeSearch,
     Filesystem(RegisteredFilesystemTool),
     McpDirect(RegisteredMcpTool),
@@ -65,6 +70,7 @@ enum ToolKind {
 pub struct RegisteredMcpTool {
     pub model_name: String,
     pub identity: String,
+    pub source: String,
     pub name: String,
     pub call_name: String,
     pub requires_approval: bool,
@@ -102,11 +108,15 @@ impl ToolRegistry {
         registry.add_builtin(runtime_echo_spec(), ToolKind::RuntimeEcho);
         registry.add_builtin(skill_spec(), ToolKind::Skill);
         registry.add_builtin(mcp_call_spec(), ToolKind::McpCall);
+        registry.add_builtin(tool_search_spec(), ToolKind::McpToolSearch);
         registry.add_builtin(knowledge_search_spec(), ToolKind::KnowledgeSearch);
         registry
     }
 
-    pub fn from_capabilities(mcp: &McpBridge, filesystem: &FilesystemRuntime) -> Self {
+    pub fn from_capabilities(
+        filesystem: &FilesystemRuntime,
+        loaded_mcp_tools: &[McpRegistryTool],
+    ) -> Self {
         let mut registry = Self::builtin();
         for spec in filesystem.tool_specs() {
             registry.add_builtin(
@@ -121,14 +131,15 @@ impl ToolRegistry {
                 }),
             );
         }
-        registry.mcp_tools = mcp
-            .enabled_tools()
-            .into_iter()
+
+        registry.mcp_tools = loaded_mcp_tools
+            .iter()
             .map(|tool| RegisteredMcpTool {
-                model_name: tool.model_tool_name(),
-                identity: tool.full_name(),
+                model_name: tool.model_tool_name.clone(),
+                identity: tool.identity.clone(),
+                source: tool.source.clone(),
                 name: tool.name.clone(),
-                call_name: tool.call_name(),
+                call_name: tool.call_name.clone(),
                 requires_approval: tool.requires_approval,
             })
             .collect();
@@ -144,20 +155,22 @@ impl ToolRegistry {
                 model_name: model_name.clone(),
                 ..tool
             };
+            let Some(source) = loaded_mcp_tools
+                .iter()
+                .find(|source| source.identity == registered.identity)
+            else {
+                continue;
+            };
             registry.tools.push(RegisteredTool {
                 spec: ToolSpec {
                     name: model_name,
                     description: format!(
-                        "CyberStrikeAI MCP tool {}. {}",
-                        registered.identity,
-                        mcp.tool_description(&registered.identity)
-                            .unwrap_or_default()
+                        "CyberStrikeAI MCP tool {} (schema_hash {}). {}",
+                        registered.identity, source.schema_hash, source.short_description
                     )
                     .trim()
                     .to_string(),
-                    parameters: mcp
-                        .tool_input_schema(&registered.identity)
-                        .unwrap_or_else(|| json!({"type":"object","properties":{}})),
+                    parameters: source.input_schema.clone(),
                 },
                 kind: ToolKind::McpDirect(registered),
             });
@@ -236,6 +249,7 @@ impl ToolRegistry {
             }
             ToolKind::Skill => builtin_invocation(&model_tool_name),
             ToolKind::KnowledgeSearch => builtin_invocation(&model_tool_name),
+            ToolKind::McpToolSearch => builtin_invocation(&model_tool_name),
             ToolKind::Filesystem(fs_tool) => ToolInvocation {
                 display_name: model_tool_name.clone(),
                 permission_name: model_tool_name.clone(),
@@ -255,6 +269,9 @@ impl ToolRegistry {
     ) -> Result<ToolOutcome, ToolRegistryError> {
         let name = call.function.name.trim();
         let Some(tool) = self.find_tool(name) else {
+            if ctx.mcp_registry.find(name).is_some() {
+                return Ok(ToolOutcome::FailedText(deferred_mcp_tool_error(name)));
+            }
             return Err(ToolRegistryError::UnsupportedTool(name.to_string()));
         };
         match &tool.kind {
@@ -282,6 +299,13 @@ impl ToolRegistry {
                     };
                     return self.execute(&canonical, ctx, on_delta);
                 }
+                if let Some(requested) =
+                    requested_tool_name_from_arguments(&call.function.arguments)
+                {
+                    if ctx.mcp_registry.find(&requested).is_some() {
+                        return Ok(ToolOutcome::FailedText(deferred_mcp_tool_error(&requested)));
+                    }
+                }
                 let result = ctx
                     .mcp
                     .execute_call(&call.function.arguments)
@@ -292,17 +316,60 @@ impl ToolRegistry {
                     Ok(ToolOutcome::Text(result))
                 }
             }
-            ToolKind::McpDirect(mcp_tool) => {
-                let args = serde_json::from_str(&call.function.arguments).map_err(|source| {
-                    ToolError::InvalidArguments {
-                        tool_name: name.to_string(),
-                        source,
-                    }
-                })?;
+            ToolKind::McpToolSearch => {
                 let result = ctx
-                    .mcp
-                    .execute_tool(&mcp_tool.call_name, args, &mcp_tool.model_name)
-                    .map_err(|err| ToolError::Mcp(err.to_string()))?;
+                    .mcp_registry
+                    .search_tool(&call.function.arguments, ctx.mcp_loaded);
+                Ok(ToolOutcome::Text(result.content))
+            }
+            ToolKind::McpDirect(mcp_tool) => {
+                if !ctx.mcp_loaded.contains(&mcp_tool.identity) {
+                    return Ok(ToolOutcome::FailedText(deferred_mcp_tool_error(
+                        &mcp_tool.identity,
+                    )));
+                }
+                let args: Value =
+                    serde_json::from_str(&call.function.arguments).map_err(|source| {
+                        ToolError::InvalidArguments {
+                            tool_name: name.to_string(),
+                            source,
+                        }
+                    })?;
+                let source_tool = ctx.mcp_registry.find(&mcp_tool.identity).cloned();
+                let result = if source_tool
+                    .as_ref()
+                    .is_some_and(|tool| tool.is_local_builtin())
+                {
+                    let payload = ctx
+                        .mcp_registry
+                        .execute_local_tool(
+                            &mcp_tool.identity,
+                            args.clone(),
+                            ctx.tool_timeout_seconds,
+                        )
+                        .map_err(|err| ToolError::Mcp(err.to_string()))?;
+                    wrap_mcp_result(
+                        &mcp_tool.model_name,
+                        &mcp_tool.identity,
+                        &mcp_tool.source,
+                        &mcp_tool.name,
+                        args,
+                        payload,
+                    )
+                } else {
+                    ctx.mcp
+                        .execute_direct_tool(
+                            &mcp_tool.source,
+                            &mcp_tool.name,
+                            &mcp_tool.call_name,
+                            args,
+                            &mcp_tool.model_name,
+                        )
+                        .map_err(|err| ToolError::Mcp(err.to_string()))?
+                };
+                if let Some(tool) = source_tool.as_ref() {
+                    ctx.mcp_loaded.mark_used(tool);
+                }
                 if wrapped_mcp_result_is_error(&result) {
                     Ok(ToolOutcome::FailedText(result))
                 } else {
@@ -368,6 +435,36 @@ impl ToolRegistry {
     }
 }
 
+fn wrap_mcp_result(
+    model_tool_name: &str,
+    identity: &str,
+    source: &str,
+    name: &str,
+    arguments: Value,
+    result: Value,
+) -> String {
+    let status = if result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "failed"
+    } else {
+        "completed"
+    };
+    json!({
+        "tool": model_tool_name,
+        "tool_kind": "mcp",
+        "mcp_tool": identity,
+        "server": source,
+        "name": name,
+        "arguments": arguments,
+        "status": status,
+        "result": result
+    })
+    .to_string()
+}
+
 fn requested_tool_name_from_value(args: &Value) -> Option<String> {
     args.get("tool")
         .or_else(|| args.get("name"))
@@ -376,6 +473,25 @@ fn requested_tool_name_from_value(args: &Value) -> Option<String> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn requested_tool_name_from_arguments(arguments: &str) -> Option<String> {
+    let args: Value = serde_json::from_str(arguments).ok()?;
+    requested_tool_name_from_value(&args)
+}
+
+fn deferred_mcp_tool_error(requested: &str) -> String {
+    json!({
+        "tool_kind": "mcp",
+        "status": "deferred_schema_required",
+        "requested_tool": requested,
+        "message": format!(
+            "MCP tool '{}' is not loaded with a full JSON schema in this request. Call tool_search with select:{} first, then wait for the next model request before calling the tool. Do not guess parameters.",
+            requested,
+            requested
+        )
+    })
+    .to_string()
 }
 
 fn normalize_runtime_tool_arguments(arguments: &Value) -> Value {
@@ -499,7 +615,7 @@ fn skill_spec() -> ToolSpec {
 fn mcp_call_spec() -> ToolSpec {
     ToolSpec {
         name: "mcp_call".to_string(),
-        description: "Compatibility fallback for calling a CyberStrikeAI external MCP tool by name. Prefer the concrete MCP tool schemas exposed separately.".to_string(),
+        description: "Compatibility fallback for older MCP calls. For Rust-owned MCP tools, use tool_search first and then call the loaded concrete tool schema.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -509,6 +625,32 @@ fn mcp_call_spec() -> ToolSpec {
                 "arguments": {"type": "object"},
                 "args": {"type": "object"}
             }
+        }),
+    }
+}
+
+fn tool_search_spec() -> ToolSpec {
+    ToolSpec {
+        name: "tool_search".to_string(),
+        description: "Search the deferred CyberStrikeAI MCP tool catalog and optionally select one exact tool to load its full schema on the next model request. Use query for discovery, or select/select:<tool> for exact schema loading. Do not call a deferred MCP tool until its full schema is visible.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query, or select:<exact_tool> to load an exact tool."
+                },
+                "select": {
+                    "type": "string",
+                    "description": "Optional exact identity, model_tool_name, or tool name to load into the session."
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20
+                }
+            },
+            "required": ["query"]
         }),
     }
 }
@@ -606,6 +748,7 @@ fn plan_item_schema() -> Value {
 mod tests {
     use super::*;
     use crate::filesystem_runtime::FilesystemRuntime;
+    use crate::mcp_registry::{McpLoadedTools, McpRegistryTool, McpToolRegistry};
     use crate::model_stream::{ModelToolCall, ModelToolFunction};
     use serde_json::json;
 
@@ -619,6 +762,7 @@ mod tests {
         assert!(text.contains("runtime_echo"));
         assert!(text.contains("skill"));
         assert!(text.contains("mcp_call"));
+        assert!(text.contains("tool_search"));
         assert!(text.contains("knowledge_search"));
     }
 
@@ -641,14 +785,19 @@ mod tests {
         let mut plan = PlanStore::default();
         let skills = SkillRuntime::default();
         let mcp = McpBridge::default();
+        let mcp_registry = McpToolRegistry::new(Vec::new());
+        let mut loaded = McpLoadedTools::default();
         let knowledge = KnowledgeRuntime::default();
         let filesystem = FilesystemRuntime::default();
         let mut ctx = ToolExecutionContext {
             plan: &mut plan,
             skills: &skills,
             mcp: &mcp,
+            mcp_registry: &mcp_registry,
+            mcp_loaded: &mut loaded,
             knowledge: &knowledge,
             filesystem: &filesystem,
+            tool_timeout_seconds: 120,
         };
         let outcome = registry.execute(&call, &mut ctx, None).unwrap();
         assert!(matches!(outcome, ToolOutcome::PlanUpdated(_)));
@@ -671,14 +820,19 @@ mod tests {
         skill_context.insert("skills".to_string(), json!({"demo": "Demo skill body"}));
         let skills = SkillRuntime::from_context(&skill_context);
         let mcp = McpBridge::default();
+        let mcp_registry = McpToolRegistry::new(Vec::new());
+        let mut loaded = McpLoadedTools::default();
         let knowledge = KnowledgeRuntime::default();
         let filesystem = FilesystemRuntime::default();
         let mut ctx = ToolExecutionContext {
             plan: &mut plan,
             skills: &skills,
             mcp: &mcp,
+            mcp_registry: &mcp_registry,
+            mcp_loaded: &mut loaded,
             knowledge: &knowledge,
             filesystem: &filesystem,
+            tool_timeout_seconds: 120,
         };
         let outcome = registry.execute(&call, &mut ctx, None).unwrap();
         match outcome {
@@ -687,30 +841,38 @@ mod tests {
         }
     }
 
+    fn registry_tool_from_json(value: Value) -> McpRegistryTool {
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("lookup")
+            .to_string();
+        let context = serde_json::Map::from_iter([
+            ("mcp_enabled".to_string(), json!(true)),
+            ("mcp_tools".to_string(), json!([value])),
+        ]);
+        McpToolRegistry::from_context(&context)
+            .find(&name)
+            .unwrap()
+            .clone()
+    }
+
     #[test]
-    fn registry_exposes_mcp_tools_as_first_class_schemas() {
-        let mut context = serde_json::Map::new();
-        context.insert("mcp_enabled".to_string(), json!(true));
-        context.insert(
-            "mcp_tools".to_string(),
-            json!([
-                {
-                    "server": "demo",
-                    "name": "lookup",
-                    "description": "Lookup demo data",
-                    "input_schema": {
-                        "type": "object",
-                        "properties": {"query": {"type": "string"}},
-                        "required": ["query"]
-                    },
-                    "enabled": true,
-                    "requires_approval": true
-                }
-            ]),
-        );
-        let mcp = McpBridge::from_context(&context);
+    fn registry_exposes_only_loaded_mcp_tools_as_first_class_schemas() {
         let filesystem = FilesystemRuntime::default();
-        let registry = ToolRegistry::from_capabilities(&mcp, &filesystem);
+        let loaded = vec![registry_tool_from_json(json!({
+            "server": "demo",
+            "name": "lookup",
+            "description": "Lookup demo data",
+            "input_schema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            },
+            "enabled": true,
+            "requires_approval": true
+        }))];
+        let registry = ToolRegistry::from_capabilities(&filesystem, &loaded);
         let schemas = registry.schemas();
         let text = schemas.to_string();
 
@@ -739,17 +901,17 @@ mod tests {
 
     #[test]
     fn registry_routes_direct_mcp_tool_to_bridge() {
-        let mut context = serde_json::Map::new();
-        context.insert("mcp_enabled".to_string(), json!(true));
-        context.insert(
-            "mcp_tools".to_string(),
-            json!([
-                {"server": "demo", "name": "lookup", "enabled": true}
-            ]),
-        );
-        let mcp = McpBridge::from_context(&context);
+        let mcp_registry = McpToolRegistry::new(vec![registry_tool_from_json(json!({
+            "server": "demo",
+            "name": "lookup",
+            "enabled": true
+        }))]);
+        let mut loaded = McpLoadedTools::default();
+        loaded.mark_loaded(mcp_registry.find("demo::lookup").unwrap());
+        let loaded_tools = vec![mcp_registry.find("demo::lookup").unwrap().clone()];
+        let mcp = McpBridge::default();
         let filesystem = FilesystemRuntime::default();
-        let registry = ToolRegistry::from_capabilities(&mcp, &filesystem);
+        let registry = ToolRegistry::from_capabilities(&filesystem, &loaded_tools);
         let call = ModelToolCall {
             id: "call_mcp".to_string(),
             call_type: "function".to_string(),
@@ -766,14 +928,99 @@ mod tests {
             plan: &mut plan,
             skills: &skills,
             mcp: &mcp,
+            mcp_registry: &mcp_registry,
+            mcp_loaded: &mut loaded,
             knowledge: &knowledge,
             filesystem: &filesystem,
+            tool_timeout_seconds: 120,
         };
 
         let err = registry.execute(&call, &mut ctx, None).unwrap_err();
         assert!(err
             .to_string()
             .contains("mcp endpoint URL is not configured"));
+    }
+
+    #[test]
+    fn registry_executes_builtin_local_mcp_tool_without_endpoint() {
+        let input_schema = json!({"type":"object","properties":{"message":{"type":"string"}}});
+        let local_tool = McpRegistryTool {
+            source: "builtin".to_string(),
+            identity: "builtin::echo-local".to_string(),
+            model_tool_name: "echo-local".to_string(),
+            name: "echo-local".to_string(),
+            call_name: "echo-local".to_string(),
+            short_description: "local echo".to_string(),
+            description: "local echo".to_string(),
+            input_schema: input_schema.clone(),
+            schema_token_estimate: 10,
+            enabled: true,
+            requires_approval: false,
+            tags: vec!["test".to_string()],
+            search_text: "echo-local".to_string(),
+            schema_hash: "hash".to_string(),
+            parameter_names: vec!["message".to_string()],
+            local_executor: Some(crate::mcp_registry::LocalToolSpec {
+                command: "sh".to_string(),
+                base_args: vec![
+                    "-c".to_string(),
+                    "printf \"$1\"".to_string(),
+                    "sh".to_string(),
+                ],
+                allowed_exit_codes: Vec::new(),
+                parameters: vec![crate::mcp_registry::LocalToolParameter {
+                    name: "message".to_string(),
+                    r#type: "string".to_string(),
+                    required: true,
+                    default: None,
+                    flag: None,
+                    format: "positional".to_string(),
+                    template: None,
+                    position: Some(1),
+                }],
+            }),
+        };
+        let mcp_registry = McpToolRegistry::new(vec![local_tool]);
+        let mut loaded = McpLoadedTools::default();
+        let source_tool = mcp_registry.find("builtin::echo-local").unwrap().clone();
+        loaded.mark_loaded(&source_tool);
+        let loaded_tools = vec![source_tool];
+        let registry =
+            ToolRegistry::from_capabilities(&FilesystemRuntime::default(), &loaded_tools);
+        let call = ModelToolCall {
+            id: "call_local".to_string(),
+            call_type: "function".to_string(),
+            function: ModelToolFunction {
+                name: "echo-local".to_string(),
+                arguments: json!({"message":"local-ok"}).to_string(),
+            },
+        };
+        let mut plan = PlanStore::default();
+        let skills = SkillRuntime::default();
+        let mcp = McpBridge::default();
+        let knowledge = KnowledgeRuntime::default();
+        let filesystem = FilesystemRuntime::default();
+        let mut ctx = ToolExecutionContext {
+            plan: &mut plan,
+            skills: &skills,
+            mcp: &mcp,
+            mcp_registry: &mcp_registry,
+            mcp_loaded: &mut loaded,
+            knowledge: &knowledge,
+            filesystem: &filesystem,
+            tool_timeout_seconds: 5,
+        };
+
+        let outcome = registry.execute(&call, &mut ctx, None).unwrap();
+
+        match outcome {
+            ToolOutcome::Text(text) => {
+                assert!(text.contains("\"tool_kind\":\"mcp\""), "{text}");
+                assert!(text.contains("local-ok"), "{text}");
+                assert!(text.contains("\"status\":\"completed\""), "{text}");
+            }
+            other => panic!("unexpected outcome: {:?}", other),
+        }
     }
 
     #[test]
@@ -793,7 +1040,9 @@ mod tests {
         );
         let filesystem = FilesystemRuntime::from_context(&fs_context);
         let mcp = McpBridge::default();
-        let registry = ToolRegistry::from_capabilities(&mcp, &filesystem);
+        let mcp_registry = McpToolRegistry::new(Vec::new());
+        let mut loaded = McpLoadedTools::default();
+        let registry = ToolRegistry::from_capabilities(&filesystem, &[]);
         let schemas = registry.schemas().to_string();
         assert!(schemas.contains("\"name\":\"read_file\""));
         assert!(schemas.contains("\"name\":\"execute\""));
@@ -813,8 +1062,11 @@ mod tests {
             plan: &mut plan,
             skills: &skills,
             mcp: &mcp,
+            mcp_registry: &mcp_registry,
+            mcp_loaded: &mut loaded,
             knowledge: &knowledge,
             filesystem: &filesystem,
+            tool_timeout_seconds: 120,
         };
         let outcome = registry.execute(&call, &mut ctx, None).unwrap();
         match outcome {
@@ -842,7 +1094,9 @@ mod tests {
     fn mcp_call_rejects_unregistered_runtime_tool_with_direct_call_hint() {
         let mcp = McpBridge::default();
         let filesystem = FilesystemRuntime::default();
-        let registry = ToolRegistry::from_capabilities(&mcp, &filesystem);
+        let mcp_registry = McpToolRegistry::new(Vec::new());
+        let mut loaded = McpLoadedTools::default();
+        let registry = ToolRegistry::from_capabilities(&filesystem, &[]);
         let call = ModelToolCall {
             id: "call_execute_as_mcp".to_string(),
             call_type: "function".to_string(),
@@ -864,8 +1118,11 @@ mod tests {
             plan: &mut plan,
             skills: &skills,
             mcp: &mcp,
+            mcp_registry: &mcp_registry,
+            mcp_loaded: &mut loaded,
             knowledge: &knowledge,
             filesystem: &filesystem,
+            tool_timeout_seconds: 120,
         };
 
         let err = registry.execute(&call, &mut ctx, None).unwrap_err();
@@ -891,7 +1148,9 @@ mod tests {
         );
         let filesystem = FilesystemRuntime::from_context(&fs_context);
         let mcp = McpBridge::default();
-        let registry = ToolRegistry::from_capabilities(&mcp, &filesystem);
+        let mcp_registry = McpToolRegistry::new(Vec::new());
+        let mut loaded = McpLoadedTools::default();
+        let registry = ToolRegistry::from_capabilities(&filesystem, &[]);
         let call = ModelToolCall {
             id: "call_execute_as_mcp".to_string(),
             call_type: "function".to_string(),
@@ -922,8 +1181,11 @@ mod tests {
             plan: &mut plan,
             skills: &skills,
             mcp: &mcp,
+            mcp_registry: &mcp_registry,
+            mcp_loaded: &mut loaded,
             knowledge: &knowledge,
             filesystem: &filesystem,
+            tool_timeout_seconds: 120,
         };
 
         let outcome = registry.execute(&call, &mut ctx, None).unwrap();
@@ -939,24 +1201,16 @@ mod tests {
 
     #[test]
     fn registry_exposes_builtin_mcp_tools_by_original_name() {
-        let mut context = serde_json::Map::new();
-        context.insert("mcp_enabled".to_string(), json!(true));
-        context.insert(
-            "mcp_tools".to_string(),
-            json!([
-                {
-                    "server": "builtin",
-                    "name": "read_file",
-                    "call_name": "read_file",
-                    "model_name": "read_file",
-                    "enabled": true,
-                    "requires_approval": false
-                }
-            ]),
-        );
-        let mcp = McpBridge::from_context(&context);
+        let loaded = vec![registry_tool_from_json(json!({
+            "server": "builtin",
+            "name": "read_file",
+            "call_name": "read_file",
+            "model_name": "read_file",
+            "enabled": true,
+            "requires_approval": false
+        }))];
         let filesystem = FilesystemRuntime::default();
-        let registry = ToolRegistry::from_capabilities(&mcp, &filesystem);
+        let registry = ToolRegistry::from_capabilities(&filesystem, &loaded);
         let schemas = registry.schemas();
         let text = schemas.to_string();
         assert!(text.contains("\"name\":\"read_file\""));
@@ -979,21 +1233,13 @@ mod tests {
 
     #[test]
     fn registry_bounds_long_mcp_model_tool_names() {
-        let mut context = serde_json::Map::new();
-        context.insert("mcp_enabled".to_string(), json!(true));
-        context.insert(
-            "mcp_tools".to_string(),
-            json!([
-                {
-                    "server": "very-long-server-name-with-many-segments-and-extra-context",
-                    "name": "very-long-tool-name-that-would-otherwise-exceed-openai-function-name-limit",
-                    "enabled": true
-                }
-            ]),
-        );
-        let mcp = McpBridge::from_context(&context);
+        let loaded = vec![registry_tool_from_json(json!({
+            "server": "very-long-server-name-with-many-segments-and-extra-context",
+            "name": "very-long-tool-name-that-would-otherwise-exceed-openai-function-name-limit",
+            "enabled": true
+        }))];
         let filesystem = FilesystemRuntime::default();
-        let registry = ToolRegistry::from_capabilities(&mcp, &filesystem);
+        let registry = ToolRegistry::from_capabilities(&filesystem, &loaded);
         let schemas = registry.schemas();
         let tool_name = schemas
             .as_array()
@@ -1014,26 +1260,14 @@ mod tests {
 
     #[test]
     fn registry_keeps_collision_suffix_within_model_tool_name_limit() {
-        let mut context = serde_json::Map::new();
-        context.insert("mcp_enabled".to_string(), json!(true));
-        context.insert(
-            "mcp_tools".to_string(),
-            json!([
-                {
-                    "server": "very-long-server-name-with-many-segments-and-extra-context",
-                    "name": "very-long-tool-name-that-would-otherwise-exceed-openai-function-name-limit",
-                    "enabled": true
-                },
-                {
-                    "server": "very-long-server-name-with-many-segments-and-extra-context",
-                    "name": "very-long-tool-name-that-would-otherwise-exceed-openai-function-name-limit",
-                    "enabled": true
-                }
-            ]),
-        );
-        let mcp = McpBridge::from_context(&context);
+        let tool = registry_tool_from_json(json!({
+            "server": "very-long-server-name-with-many-segments-and-extra-context",
+            "name": "very-long-tool-name-that-would-otherwise-exceed-openai-function-name-limit",
+            "enabled": true
+        }));
+        let loaded = vec![tool.clone(), tool];
         let filesystem = FilesystemRuntime::default();
-        let registry = ToolRegistry::from_capabilities(&mcp, &filesystem);
+        let registry = ToolRegistry::from_capabilities(&filesystem, &loaded);
         let schemas = registry.schemas();
         let tool_names: Vec<&str> = schemas
             .as_array()
@@ -1057,17 +1291,14 @@ mod tests {
 
     #[test]
     fn resolved_mcp_call_omits_generic_mcp_call_permission_alias() {
-        let mut context = serde_json::Map::new();
-        context.insert("mcp_enabled".to_string(), json!(true));
-        context.insert(
-            "mcp_tools".to_string(),
-            json!([
-                {"server": "demo", "name": "lookup", "enabled": true, "requires_approval": false}
-            ]),
-        );
-        let mcp = McpBridge::from_context(&context);
+        let loaded = vec![registry_tool_from_json(json!({
+            "server": "demo",
+            "name": "lookup",
+            "enabled": true,
+            "requires_approval": false
+        }))];
         let filesystem = FilesystemRuntime::default();
-        let registry = ToolRegistry::from_capabilities(&mcp, &filesystem);
+        let registry = ToolRegistry::from_capabilities(&filesystem, &loaded);
         let call = ModelToolCall {
             id: "call_mcp".to_string(),
             call_type: "function".to_string(),

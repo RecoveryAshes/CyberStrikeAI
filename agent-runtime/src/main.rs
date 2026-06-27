@@ -6,6 +6,7 @@ mod grpc_protocol;
 mod grpc_server;
 mod knowledge_runtime;
 mod mcp_bridge;
+mod mcp_registry;
 mod model_stream;
 mod permission;
 mod plan_store;

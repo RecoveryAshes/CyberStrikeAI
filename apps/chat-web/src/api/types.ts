@@ -73,6 +73,16 @@ export type ProcessDetail = {
   createdAt?: string;
 };
 
+export type RuntimeTodoItem = {
+  itemId?: string;
+  item_id?: string;
+  id?: string;
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "cancelled" | string;
+  position?: number;
+  updatedAt?: string;
+};
+
 export type HITLConfig = {
   enabled: boolean;
   mode?: string;

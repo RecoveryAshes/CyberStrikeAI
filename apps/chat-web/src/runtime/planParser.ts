@@ -38,10 +38,11 @@ export function normalizePlanItems(raw: unknown, idPrefix = "plan"): PlanItem[] 
   return maybeItems.map((item, index) => {
     if (item && typeof item === "object") {
       const obj = item as Record<string, unknown>;
+      const status = statusMap[String(obj.status || "pending").trim().toLowerCase()] || "pending";
       return {
-        id: String(obj.id || obj.content || obj.task || `${idPrefix}-${index}`),
+        id: String(obj.id || obj.itemId || obj.item_id || obj.content || obj.task || `${idPrefix}-${index}`),
         content: String(obj.content || obj.task || obj.step || obj.text || obj.title || `Step ${index + 1}`),
-        status: String(obj.status || "pending") as PlanItemStatus
+        status
       };
     }
     return {

@@ -9,7 +9,8 @@ import type {
   HITLPendingItem,
   ProcessDetail,
   Project,
-  Role
+  Role,
+  RuntimeTodoItem
 } from "./types";
 
 export const Api = {
@@ -28,6 +29,8 @@ export const Api = {
   createConversation: (title = "New Chat") =>
     apiFetch<ConversationDetail>("/api/conversations", { method: "POST", body: JSON.stringify({ title }) }),
   conversation: (id: string) => apiFetch<ConversationDetail>(`/api/conversations/${id}?include_process_details=0`),
+  runtimeTodos: (id: string) =>
+    apiFetch<{ conversationId: string; todos: RuntimeTodoItem[] }>(`/api/conversations/${id}/runtime-todos`),
   renameConversation: (id: string, title: string) =>
     apiFetch<ConversationDetail>(`/api/conversations/${id}`, { method: "PUT", body: JSON.stringify({ title }) }),
   setConversationProject: (id: string, projectId: string) =>

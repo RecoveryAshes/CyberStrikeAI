@@ -1,12 +1,18 @@
 package handler
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"cyberstrike-ai/internal/audit"
 	"cyberstrike-ai/internal/config"
@@ -41,22 +47,30 @@ func NewRoleHandler(cfg *config.Config, configPath string, logger *zap.Logger) *
 
 // GetRoles 获取所有角色
 func (h *RoleHandler) GetRoles(c *gin.Context) {
-	if h.config.Roles == nil {
-		h.config.Roles = make(map[string]config.RoleConfig)
+	if err := h.syncRolesToRust(c.Request.Context()); err != nil {
+		h.log().Error("同步角色到 Rust API 失败", zap.Error(err))
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Rust API roles sync failed: " + err.Error()})
+		return
 	}
+	h.proxyResourceToRustAndWrite(c, "/api/roles")
+}
 
-	roles := make([]config.RoleConfig, 0, len(h.config.Roles))
-	for key, role := range h.config.Roles {
-		// 确保角色的key与name一致
-		if role.Name == "" {
-			role.Name = key
-		}
-		roles = append(roles, role)
+func (h *RoleHandler) proxyResourceToRustAndWrite(c *gin.Context, path string) {
+	status, body, contentType, ok := proxyRequestToRust(c, nil, path, c.Request.URL.RawQuery, h.log(), "Rust API 资源")
+	if !ok {
+		return
 	}
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/json; charset=utf-8"
+	}
+	c.Data(status, contentType, body)
+}
 
-	c.JSON(http.StatusOK, gin.H{
-		"roles": roles,
-	})
+func (h *RoleHandler) log() *zap.Logger {
+	if h != nil && h.logger != nil {
+		return h.logger
+	}
+	return zap.NewNop()
 }
 
 // GetRole 获取单个角色
@@ -179,6 +193,9 @@ func (h *RoleHandler) UpdateRole(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存配置失败: " + err.Error()})
 		return
 	}
+	if err := h.syncRoleToRust(c.Request.Context(), finalKey, req); err != nil {
+		h.logger.Warn("同步角色到 Rust API 失败", zap.String("role", finalKey), zap.Error(err))
+	}
 
 	h.logger.Info("更新角色", zap.String("oldKey", roleName), zap.String("newKey", finalKey), zap.String("name", req.Name))
 	if h.audit != nil {
@@ -227,6 +244,9 @@ func (h *RoleHandler) CreateRole(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存配置失败: " + err.Error()})
 		return
 	}
+	if err := h.syncRoleToRust(c.Request.Context(), req.Name, req); err != nil {
+		h.logger.Warn("同步角色到 Rust API 失败", zap.String("role", req.Name), zap.Error(err))
+	}
 
 	h.logger.Info("创建角色", zap.String("roleName", req.Name))
 	if h.audit != nil {
@@ -263,6 +283,9 @@ func (h *RoleHandler) DeleteRole(c *gin.Context) {
 	}
 
 	delete(h.config.Roles, roleName)
+	if err := h.deleteRoleFromRust(c.Request.Context(), roleName); err != nil {
+		h.logger.Warn("从 Rust API 删除角色失败", zap.String("role", roleName), zap.Error(err))
+	}
 
 	// 删除对应的角色文件
 	configDir := filepath.Dir(h.configPath)
@@ -365,6 +388,119 @@ func (h *RoleHandler) saveConfig() error {
 		}
 	}
 
+	return nil
+}
+
+func (h *RoleHandler) syncRolesToRust(ctx context.Context) error {
+	if h == nil || h.config == nil || len(h.config.Roles) == 0 {
+		return nil
+	}
+	for roleName, role := range h.config.Roles {
+		if err := h.syncRoleToRust(ctx, roleName, role); err != nil {
+			return fmt.Errorf("sync role %q: %w", roleName, err)
+		}
+	}
+	return nil
+}
+
+func (h *RoleHandler) syncRoleToRust(ctx context.Context, roleName string, role config.RoleConfig) error {
+	name := strings.TrimSpace(role.Name)
+	if name == "" {
+		name = strings.TrimSpace(roleName)
+	}
+	if name == "" {
+		return nil
+	}
+	value, err := json.Marshal(role)
+	if err != nil {
+		return err
+	}
+	payload := map[string]interface{}{
+		"name":    name,
+		"value":   json.RawMessage(value),
+		"enabled": role.Enabled,
+	}
+	return postJSONToRust(ctx, nil, "/api/internal/roles", payload)
+}
+
+func (h *RoleHandler) deleteRoleFromRust(ctx context.Context, roleName string) error {
+	roleName = strings.TrimSpace(roleName)
+	if roleName == "" {
+		return nil
+	}
+	return deleteRustResource(ctx, nil, "/api/internal/roles/"+url.PathEscape(roleName))
+}
+
+func postJSONToRust(ctx context.Context, client *http.Client, path string, payload interface{}) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	cfg := rustAPIProxyConfigFromEnv()
+	target, err := rustAPITarget(cfg, path, "")
+	if err != nil {
+		return err
+	}
+	timeoutSeconds := cfg.TimeoutSeconds
+	if timeoutSeconds <= 0 || timeoutSeconds > 5 {
+		timeoutSeconds = 5
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, target.String(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Rust API %s returned %s: %s", path, resp.Status, strings.TrimSpace(string(respBody)))
+	}
+	return nil
+}
+
+func deleteRustResource(ctx context.Context, client *http.Client, path string) error {
+	cfg := rustAPIProxyConfigFromEnv()
+	target, err := rustAPITarget(cfg, path, "")
+	if err != nil {
+		return err
+	}
+	timeoutSeconds := cfg.TimeoutSeconds
+	if timeoutSeconds <= 0 || timeoutSeconds > 5 {
+		timeoutSeconds = 5
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSeconds)*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodDelete, target.String(), nil)
+	if err != nil {
+		return err
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Rust API %s returned %s: %s", path, resp.Status, strings.TrimSpace(string(respBody)))
+	}
 	return nil
 }
 
